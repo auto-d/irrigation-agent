@@ -14,11 +14,6 @@ We explicitly separate:
 
 Working area for perception experiments that ingest a live RTSP/RTSPS camera feed instead of the thermal camera path.
 
-## Development notes (remove before submission)
-
-Improvements
-- consider adding background monitor on the watering system to shut it off if I accidentally leave it running (manual enable)
-
 ## Perception 
 
 Perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and historical watering events. 
