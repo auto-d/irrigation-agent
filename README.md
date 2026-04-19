@@ -55,6 +55,8 @@ class Event:
 
 Actions are limited to actuating watering of the lawn and notifying humans off errors/or conflicts (service call)
 
+For MVP, the planner/action interface is intentionally synchronous: planners emit one decision per tick and receive an immediate coarse action result, avoiding async in-flight action state that would otherwise bloat the classical planner's state space without a clear policy benefit yet.
+
 TODO: paste more schema defs to help user appreciate underlying mechanism
 
 ### Evaluation Support

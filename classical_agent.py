@@ -3,11 +3,18 @@ Classical planner implementation
 
 NOTE: core loop refactored from auto-d/classical_planning/planner.py
 """
+from __future__ import annotations
+
 import re
 import sys 
 import time 
 import heapq
 import argparse 
+from collections import deque
+from datetime import datetime
+from typing import Any, Dict
+
+from planner import Decision, Event
 
 # Domain definition : Below schemas code for states that must be matched prior to fluent modification
 # TODO: retrofit for lawn-watering planner!
@@ -213,8 +220,7 @@ def forward_search(initial_state, goal, actions, log=False):
             
             if not frozenset(reachable_state) in visited: 
                 visited.add(frozenset(reachable_state))
-                plan.append(action['name'])
-                queue.append((reachable_state, plan))
+                queue.append((reachable_state, plan + [action['name']]))
 
     return None, explored  # No plan found
 
@@ -311,6 +317,75 @@ def heuristic_search(initial_state, goal, hint, actions, log=False):
                 counter +=1 
     
     return None, explored  # No plan found
+
+
+class ClassicalPlanner:
+    """Minimal rule-based planner for MVP CLI execution."""
+
+    name = "classical"
+
+    def __init__(self) -> None:
+        self._events: deque[Event] = deque(maxlen=256)
+        self._latest: Dict[tuple[str, str], Event] = {}
+
+    def observe(self, event: Event) -> None:
+        self._events.append(event)
+        self._latest[(event.source, event.type)] = event
+
+    def decide(self, now: datetime) -> Decision:
+        irrigation = self._payload("irrigation", "irrigation_status")
+        precipitation = self._payload("precipitation", "precipitation_summary")
+        forecast = self._payload("weather", "forecast_summary")
+        camera = self._payload("camera", "scene_activity")
+
+        if irrigation.get("api_reports_on") or irrigation.get("expected_on"):
+            return Decision(
+                timestamp=now,
+                planner=self.name,
+                action="no_op",
+                rationale="Irrigation appears to be running or expected to be running already.",
+                metadata={"source": "irrigation"},
+            )
+
+        if precipitation.get("recent_rain") or precipitation.get("total_inches", 0.0) >= 0.1:
+            return Decision(
+                timestamp=now,
+                planner=self.name,
+                action="no_op",
+                rationale="Recent precipitation exceeds the watering threshold.",
+                metadata={"source": "precipitation"},
+            )
+
+        if (forecast.get("max_precip_probability") or 0) >= 50 or forecast.get("rain_expected_soon"):
+            return Decision(
+                timestamp=now,
+                planner=self.name,
+                action="no_op",
+                rationale="Forecast indicates rain is likely soon.",
+                metadata={"source": "weather"},
+            )
+
+        if camera.get("person_detected") or camera.get("animal_detected") or camera.get("lawn_mower_active"):
+            return Decision(
+                timestamp=now,
+                planner=self.name,
+                action="water_off",
+                rationale="Scene appears occupied or unsafe for watering.",
+                metadata={"source": "camera"},
+            )
+
+        return Decision(
+            timestamp=now,
+            planner=self.name,
+            action="water_on",
+            duration_seconds=300,
+            rationale="No rain signal or occupancy conflict detected; emit a short watering action.",
+            metadata={"source": "rule_heuristic"},
+        )
+
+    def _payload(self, source: str, event_type: str) -> Dict[str, Any]:
+        event = self._latest.get((source, event_type))
+        return event.payload if event is not None else {}
 
 # Main 
 def main(): 

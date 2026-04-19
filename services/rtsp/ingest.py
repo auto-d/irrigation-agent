@@ -135,7 +135,7 @@ class DebugFrameWriter:
         print(f"saved_debug_frame path={filename} src_frame={frame_count} elapsed={elapsed:.2f}s")
 
 
-def ffprobe_stream_dimensions(url, transport="tcp", tls_verify=False, ffprobe_bin="ffprobe"):
+def _ffprobe_stream_payload(url, transport="tcp", tls_verify=False, ffprobe_bin="ffprobe"):
     cmd = [
         ffprobe_bin,
         "-v",
@@ -143,7 +143,7 @@ def ffprobe_stream_dimensions(url, transport="tcp", tls_verify=False, ffprobe_bi
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height",
+        "stream=index,codec_name,codec_long_name,profile,codec_type,width,height,pix_fmt,avg_frame_rate,r_frame_rate,bit_rate,nb_frames,time_base",
         "-of",
         "json",
     ]
@@ -166,13 +166,72 @@ def ffprobe_stream_dimensions(url, transport="tcp", tls_verify=False, ffprobe_bi
     streams = payload.get("streams") or []
     if not streams:
         raise RuntimeError("ffprobe found no video streams in the RTSP source")
+    return payload, streams[0]
 
-    width = streams[0].get("width")
-    height = streams[0].get("height")
+
+def _parse_ffprobe_rate(rate):
+    if not rate or rate in {"0/0", "N/A"}:
+        return None
+    if isinstance(rate, (int, float)):
+        return float(rate)
+    if isinstance(rate, str) and "/" in rate:
+        numerator, denominator = rate.split("/", 1)
+        try:
+            numerator_value = float(numerator)
+            denominator_value = float(denominator)
+        except ValueError:
+            return None
+        if denominator_value == 0:
+            return None
+        return numerator_value / denominator_value
+    try:
+        return float(rate)
+    except (TypeError, ValueError):
+        return None
+
+
+def ffprobe_stream_info(url, transport="tcp", tls_verify=False, ffprobe_bin="ffprobe"):
+    _, stream = _ffprobe_stream_payload(
+        url,
+        transport=transport,
+        tls_verify=tls_verify,
+        ffprobe_bin=ffprobe_bin,
+    )
+    width = stream.get("width")
+    height = stream.get("height")
     if not width or not height:
         raise RuntimeError("ffprobe did not return width/height for the first video stream")
 
-    return int(width), int(height)
+    return {
+        "index": stream.get("index"),
+        "codec_name": stream.get("codec_name"),
+        "codec_long_name": stream.get("codec_long_name"),
+        "profile": stream.get("profile"),
+        "codec_type": stream.get("codec_type"),
+        "width": int(width),
+        "height": int(height),
+        "pixel_format": stream.get("pix_fmt"),
+        "avg_frame_rate": _parse_ffprobe_rate(stream.get("avg_frame_rate")),
+        "raw_avg_frame_rate": stream.get("avg_frame_rate"),
+        "real_frame_rate": _parse_ffprobe_rate(stream.get("r_frame_rate")),
+        "raw_real_frame_rate": stream.get("r_frame_rate"),
+        "bit_rate": int(stream["bit_rate"]) if stream.get("bit_rate") not in (None, "N/A") else None,
+        "frame_count": int(stream["nb_frames"]) if stream.get("nb_frames") not in (None, "N/A") else None,
+        "time_base": stream.get("time_base"),
+        "transport": transport,
+        "tls_verify": tls_verify,
+        "ffprobe_bin": ffprobe_bin,
+    }
+
+
+def ffprobe_stream_dimensions(url, transport="tcp", tls_verify=False, ffprobe_bin="ffprobe"):
+    stream_info = ffprobe_stream_info(
+        url,
+        transport=transport,
+        tls_verify=tls_verify,
+        ffprobe_bin=ffprobe_bin,
+    )
+    return int(stream_info["width"]), int(stream_info["height"])
 
 
 def parse_args():

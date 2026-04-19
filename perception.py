@@ -1,0 +1,419 @@
+"""Thin perception adapters that turn service outputs into constrained events."""
+
+from __future__ import annotations
+
+import datetime as dt
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Dict, List
+
+import cv2
+import numpy as np
+
+from planner import Event
+from services.bhyve.controller import BHyveController, controller_from_env
+from services.precipitation import PrecipitationClient, PrecipitationSummary
+from services.rtsp.ingest import FFmpegVideoStream, ffprobe_stream_info
+from services.weather import Forecast, WeatherClient
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _bhyve_day(now: dt.datetime) -> int:
+    """Convert Python weekday to Orbit/B-hyve weekday numbering."""
+    return (now.weekday() + 1) % 7
+
+
+class ForecastPerceptor:
+    """Fetch and condense forecast data into a planner-facing event."""
+
+    async def probe_raw(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        hours: int | None = 12,
+        days: int | None = None,
+    ) -> Dict[str, Any]:
+        async with WeatherClient.from_env() as client:
+            point = await client.fetch_point(latitude, longitude)
+            forecast = await self._fetch_forecast(
+                client,
+                latitude,
+                longitude,
+                hours=hours,
+                days=days,
+            )
+        selected_periods = self._select_periods(forecast, hours=hours, days=days)
+        return {
+            "point": asdict(point),
+            "forecast": asdict(forecast),
+            "window": self._window_metadata(forecast, hours=hours, days=days),
+            "selected_periods": [asdict(period) for period in selected_periods],
+        }
+
+    async def perceive(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        hours: int | None = 12,
+        days: int | None = None,
+    ) -> Event:
+        async with WeatherClient.from_env() as client:
+            forecast = await self._fetch_forecast(
+                client,
+                latitude,
+                longitude,
+                hours=hours,
+                days=days,
+            )
+        return self._forecast_event(forecast, hours=hours, days=days)
+
+    async def _fetch_forecast(
+        self,
+        client: WeatherClient,
+        latitude: float,
+        longitude: float,
+        *,
+        hours: int | None,
+        days: int | None,
+    ) -> Forecast:
+        if hours is not None and days is not None:
+            raise ValueError("Specify either hours or days for the forecast window, not both.")
+        if days is not None:
+            return await client.fetch_forecast(latitude, longitude)
+        return await client.fetch_hourly_forecast(latitude, longitude)
+
+    def _forecast_event(
+        self,
+        forecast: Forecast,
+        *,
+        hours: int | None,
+        days: int | None,
+    ) -> Event:
+        next_periods = self._select_periods(forecast, hours=hours, days=days)
+        precip_probs = [
+            period.probability_of_precipitation
+            for period in next_periods
+            if period.probability_of_precipitation is not None
+        ]
+        temps = [period.temperature for period in next_periods if period.temperature is not None]
+        precip_probability_hours = round(
+            sum(self._period_duration_hours(period) * ((period.probability_of_precipitation or 0) / 100.0) for period in next_periods),
+            2,
+        )
+        hours_above_40pct = round(
+            sum(
+                self._period_duration_hours(period)
+                for period in next_periods
+                if (period.probability_of_precipitation or 0) >= 40
+            ),
+            2,
+        )
+        payload = {
+            "forecast_type": forecast.forecast_type,
+            "point": {
+                "latitude": forecast.point.latitude,
+                "longitude": forecast.point.longitude,
+                "city": forecast.point.city,
+                "state": forecast.point.state,
+                "timezone": forecast.point.timezone,
+            },
+            "window": self._window_metadata(forecast, hours=hours, days=days),
+            "periods_considered": len(next_periods),
+            "max_precip_probability": max(precip_probs) if precip_probs else None,
+            "avg_precip_probability": round(sum(precip_probs) / len(precip_probs), 1) if precip_probs else None,
+            "precip_probability_hours": precip_probability_hours,
+            "hours_above_40pct": hours_above_40pct,
+            "avg_temperature": round(sum(temps) / len(temps), 1) if temps else None,
+            "headline": next_periods[0].short_forecast if next_periods else None,
+            "rain_expected_in_window": precip_probability_hours >= 1.5 or hours_above_40pct >= 2.0,
+            "rain_expected_soon": precip_probability_hours >= 1.5 or hours_above_40pct >= 2.0,
+        }
+        return Event(timestamp=_now(), source="weather", type="forecast_summary", payload=payload)
+
+    def _select_periods(
+        self,
+        forecast: Forecast,
+        *,
+        hours: int | None,
+        days: int | None,
+    ) -> List[Any]:
+        if hours is not None and days is not None:
+            raise ValueError("Specify either hours or days for the forecast window, not both.")
+        if hours is None and days is None:
+            hours = 12
+
+        now = dt.datetime.now(dt.timezone.utc)
+        if hours is not None:
+            cutoff = now + dt.timedelta(hours=hours)
+        else:
+            cutoff = now + dt.timedelta(days=days or 0)
+
+        selected = [
+            period
+            for period in forecast.periods
+            if period.start_time < cutoff and period.end_time > now
+        ]
+        if selected:
+            return selected
+
+        if hours is not None:
+            return list(forecast.periods[:hours])
+        return list(forecast.periods[: max(1, days or 1)])
+
+    @staticmethod
+    def _period_duration_hours(period: Any) -> float:
+        return max(0.0, (period.end_time - period.start_time).total_seconds() / 3600.0)
+
+    def _window_metadata(
+        self,
+        forecast: Forecast,
+        *,
+        hours: int | None,
+        days: int | None,
+    ) -> Dict[str, Any]:
+        if hours is None and days is None:
+            hours = 12
+        return {
+            "unit": "days" if days is not None else "hours",
+            "value": days if days is not None else hours,
+            "forecast_type": forecast.forecast_type,
+        }
+
+
+class HistoricalPrecipitationPerceptor:
+    """Fetch and condense precipitation historicals into a planner-facing event."""
+
+    async def probe_raw(self, window: str) -> Dict[str, Any]:
+        async with PrecipitationClient.from_env() as client:
+            raw = await client.fetch_raw(window)
+            summary = await client.summarize(window)
+        return {
+            "raw": raw,
+            "summary": {
+                "window": summary.window,
+                "total_inches": summary.total_inches,
+                "sample_count": summary.sample_count,
+                "started_at": summary.started_at.isoformat() if summary.started_at else None,
+                "ended_at": summary.ended_at.isoformat() if summary.ended_at else None,
+            },
+        }
+
+    async def perceive(self, window: str) -> Event:
+        async with PrecipitationClient.from_env() as client:
+            summary = await client.summarize(window)
+        return self._summary_event(summary)
+
+    def _summary_event(self, summary: PrecipitationSummary) -> Event:
+        payload = {
+            "window": summary.window,
+            "total_inches": summary.total_inches,
+            "sample_count": summary.sample_count,
+            "started_at": summary.started_at.isoformat() if summary.started_at else None,
+            "ended_at": summary.ended_at.isoformat() if summary.ended_at else None,
+            "recent_rain": summary.total_inches > 0.05,
+        }
+        return Event(
+            timestamp=_now(),
+            source="precipitation",
+            type="precipitation_summary",
+            payload=payload,
+        )
+
+
+class IrrigationPerceptor:
+    """Fetch and condense irrigation controller state into a planner-facing event."""
+
+    async def probe_raw(self) -> Dict[str, Any]:
+        async with controller_from_env() as controller:
+            devices = controller.get_devices()
+            sprinkler = controller.list_sprinkler_devices()[0]
+            programs = controller.get_programs(str(sprinkler["id"]))
+            history = await controller.get_history(str(sprinkler["id"]))
+        return {
+            "devices": devices,
+            "sprinkler": sprinkler,
+            "programs": programs,
+            "history": history,
+        }
+
+    async def perceive(self) -> Event:
+        async with controller_from_env() as controller:
+            sprinkler = controller.list_sprinkler_devices()[0]
+            programs = controller.get_programs(str(sprinkler["id"]))
+        return self._irrigation_event(sprinkler, programs)
+
+    def _irrigation_event(self, sprinkler: Dict[str, Any], programs: List[Dict[str, Any]]) -> Event:
+        now_local = dt.datetime.now().astimezone()
+        expected_on, matching_programs = self._expected_programs_now(programs, now_local)
+        status = sprinkler.get("status") or {}
+        payload = {
+            "device_id": sprinkler.get("id"),
+            "name": sprinkler.get("name"),
+            "connected": sprinkler.get("is_connected"),
+            "run_mode": status.get("run_mode"),
+            "api_reports_on": self._api_reports_on(status),
+            "expected_on": expected_on,
+            "matching_programs": matching_programs,
+            "next_start_time": status.get("next_start_time"),
+            "next_start_programs": status.get("next_start_programs"),
+        }
+        return Event(timestamp=_now(), source="irrigation", type="irrigation_status", payload=payload)
+
+    @staticmethod
+    def _api_reports_on(status: Dict[str, Any]) -> bool:
+        if status.get("run_mode") == "manual":
+            return True
+        watering_status = status.get("watering_status")
+        if not isinstance(watering_status, dict):
+            return False
+        return any(
+            watering_status.get(key) not in (None, [], {}, "")
+            for key in ("current_station", "run_time", "started_watering_station_at", "stations", "program")
+        )
+
+    @staticmethod
+    def _expected_programs_now(programs: List[Dict[str, Any]], now_local: dt.datetime) -> tuple[bool, List[str]]:
+        matching: List[str] = []
+        day = _bhyve_day(now_local)
+        for program in programs:
+            if not program.get("enabled", True):
+                continue
+            frequency = program.get("frequency") or {}
+            if frequency.get("type") == "days" and day not in frequency.get("days", []):
+                continue
+            total_runtime = sum(int(run.get("run_time", 0)) for run in program.get("run_times", []))
+            for start_time in program.get("start_times", []):
+                try:
+                    hour, minute = [int(part) for part in start_time.split(":", 1)]
+                except Exception:
+                    continue
+                started = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                ended = started + dt.timedelta(minutes=total_runtime)
+                if started <= now_local <= ended:
+                    matching.append(program.get("program") or program.get("name") or program.get("id"))
+        return (len(matching) > 0, matching)
+
+
+class SecurityCameraPerceptor:
+    """Sample one or more frames and emit a constrained scene event."""
+
+    def probe_raw(
+        self,
+        url: str,
+        *,
+        sample_frames: int = 1,
+        save_frame_path: str | None = None,
+    ) -> Dict[str, Any]:
+        stream_info = ffprobe_stream_info(url)
+        stats, capture_info = self._sample_frame_stats(
+            url,
+            width=int(stream_info["width"]),
+            height=int(stream_info["height"]),
+            sample_frames=sample_frames,
+            save_frame_path=save_frame_path,
+        )
+        return {
+            "stream": stream_info,
+            "sample_frames": sample_frames,
+            "frame_stats": stats,
+            "capture": capture_info,
+        }
+
+    def perceive(
+        self,
+        url: str,
+        *,
+        sample_frames: int = 3,
+        save_frame_path: str | None = None,
+    ) -> Event:
+        stream_info = ffprobe_stream_info(url)
+        stats, capture_info = self._sample_frame_stats(
+            url,
+            width=int(stream_info["width"]),
+            height=int(stream_info["height"]),
+            sample_frames=sample_frames,
+            save_frame_path=save_frame_path,
+        )
+        mean_brightness = round(float(np.mean([frame["mean_brightness"] for frame in stats])), 2) if stats else None
+        motion_score = max((frame["motion_score"] for frame in stats), default=0.0)
+        payload = {
+            "width": stream_info["width"],
+            "height": stream_info["height"],
+            "sample_frames": len(stats),
+            "saved_frame_path": capture_info.get("saved_frame_path"),
+            "mean_brightness": mean_brightness,
+            "motion_score": round(float(motion_score), 4),
+            "interpretation": "unclassified_scene",
+            "person_detected": None,
+            "animal_detected": None,
+            "lawn_mower_active": None,
+        }
+        return Event(timestamp=_now(), source="camera", type="scene_activity", payload=payload)
+
+    def _sample_frame_stats(
+        self,
+        url: str,
+        *,
+        width: int,
+        height: int,
+        sample_frames: int,
+        save_frame_path: str | None = None,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        stats: List[Dict[str, Any]] = []
+        previous_gray = None
+        saved_frame_path: str | None = None
+        first_frame_shape: List[int] | None = None
+        first_frame_dtype: str | None = None
+        started_at = time.monotonic()
+        with FFmpegVideoStream(url, width, height).start() as stream:
+            for index in range(sample_frames):
+                frame, error = stream.read()
+                if frame is None:
+                    raise RuntimeError(f"Unable to read RTSP frame: {error or 'unknown error'}")
+                if index == 0:
+                    first_frame_shape = list(frame.shape)
+                    first_frame_dtype = str(frame.dtype)
+                if index == 0 and save_frame_path:
+                    saved_frame_path = self._write_debug_frame(frame, save_frame_path)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                mean_brightness = float(np.mean(gray))
+                brightness_stddev = float(np.std(gray))
+                contrast = brightness_stddev
+                blur_laplacian_variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                motion_score = 0.0
+                if previous_gray is not None:
+                    motion_score = float(np.mean(cv2.absdiff(gray, previous_gray)))
+                previous_gray = gray
+                stats.append(
+                    {
+                        "index": index,
+                        "mean_brightness": mean_brightness,
+                        "brightness_stddev": brightness_stddev,
+                        "contrast": contrast,
+                        "blur_laplacian_variance": blur_laplacian_variance,
+                        "motion_score": motion_score,
+                    }
+                )
+        elapsed_seconds = max(time.monotonic() - started_at, 1e-6)
+        capture_info = {
+            "saved_frame_path": saved_frame_path,
+            "frame_shape": first_frame_shape,
+            "dtype": first_frame_dtype,
+            "elapsed_seconds": round(elapsed_seconds, 4),
+            "approx_fps": round(len(stats) / elapsed_seconds, 3),
+        }
+        return stats, capture_info
+
+    @staticmethod
+    def _write_debug_frame(frame: Any, save_frame_path: str) -> str:
+        path = Path(save_frame_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(path), frame):
+            raise RuntimeError(f"Failed to write debug frame to {path}")
+        return str(path.resolve())

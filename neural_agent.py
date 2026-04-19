@@ -4,9 +4,16 @@ Scratch-built agent framework to demonstrate the underlying abstractions
 NOTE: Backend, Tool, Agent classes refactored from auto-d/voice-agent/agent.py
 """
 
-from openai import OpenAI 
+from __future__ import annotations
+
+import datetime as dt
+import os
 from copy import deepcopy
 import json 
+from typing import Any, Dict, List
+
+from classical_agent import ClassicalPlanner
+from planner import Decision, Event
 
 class Backend(): 
     """
@@ -19,6 +26,11 @@ class Backend():
         """
         Create a backend model abstraction that simplifies text completions
         """
+        try:
+            from openai import OpenAI
+        except ImportError as err:
+            raise RuntimeError("The OpenAI Python package is required for neural planner execution.") from err
+
         self.api_key = api_key 
         self.model = model
         self.client = OpenAI(api_key=self.api_key)
@@ -53,27 +65,25 @@ class Backend():
         text = [] 
         tool_calls = []
         for r in response.output:
-            match r.type: 
-                case "reasoning":
-                    if include_reasoning: 
-                        text.append(r.summary)
-                case "message": 
-                    for c in r.content: 
-                        match c.type: 
-                            case "output_text": 
-                                text.append(c.text)
-                            case "function_call":
-                                tool_calls.append(c)       
-                            case "tool_call":
-                                raise NotImplementedError("Need to implement support for newer function calling semantics!")
-                            case _: 
-                                raise ValueError(f"Unexpected message type received: {c.type}")
-                case "function_call": 
-                    tool_calls.append(r)
-                case "tool_call":
-                    raise NotImplementedError("Need to implement support for newer function calling semantics!")
-                case _: 
-                    raise ValueError(f"Unexpected response type received: {r.type}")
+            if r.type == "reasoning":
+                if include_reasoning:
+                    text.append(r.summary)
+            elif r.type == "message":
+                for c in r.content:
+                    if c.type == "output_text":
+                        text.append(c.text)
+                    elif c.type == "function_call":
+                        tool_calls.append(c)
+                    elif c.type == "tool_call":
+                        raise NotImplementedError("Need to implement support for newer function calling semantics!")
+                    else:
+                        raise ValueError(f"Unexpected message type received: {c.type}")
+            elif r.type == "function_call":
+                tool_calls.append(r)
+            elif r.type == "tool_call":
+                raise NotImplementedError("Need to implement support for newer function calling semantics!")
+            else:
+                raise ValueError(f"Unexpected response type received: {r.type}")
                 
         return text, tool_calls 
 
@@ -351,3 +361,75 @@ class NeuralPlanner(LlmAgent):
         #text = self.chat([prompt], tools=available_tools)
         #result = "\n".join(text).strip()
 
+
+class NeuralMvpPlanner:
+    """Small planner adapter for the MVP CLI.
+
+    If `OPENAI_API_KEY` is available, this planner asks an LLM to emit a JSON
+    decision. If the backend is unavailable or the response is malformed, it
+    falls back to the same heuristic policy used by the classical planner.
+    """
+
+    name = "neural"
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self._events: List[Event] = []
+        self._fallback = ClassicalPlanner()
+        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self._backend = Backend(self._api_key, model="gpt-5.4-mini") if self._api_key else None
+
+    def observe(self, event: Event) -> None:
+        self._events.append(event)
+        self._fallback.observe(event)
+
+    def decide(self, now: dt.datetime) -> Decision:
+        if self._backend is None:
+            decision = self._fallback.decide(now)
+            decision.planner = self.name
+            decision.metadata["fallback"] = "no_api_key"
+            return decision
+
+        prompt = self._decision_prompt(now)
+        try:
+            response = self._backend.send(
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ]
+            )
+            text_chunks, _ = self._backend.unpack_response(response)
+            content = "\n".join(text_chunks).strip()
+            parsed = json.loads(content)
+            return Decision(
+                timestamp=now,
+                planner=self.name,
+                action=parsed.get("action", "no_op"),
+                duration_seconds=parsed.get("duration_seconds"),
+                rationale=parsed.get("rationale", "No rationale provided."),
+                metadata={"raw_response": content},
+            )
+        except Exception as err:
+            decision = self._fallback.decide(now)
+            decision.planner = self.name
+            decision.metadata["fallback"] = f"backend_error:{type(err).__name__}"
+            return decision
+
+    def _decision_prompt(self, now: dt.datetime) -> str:
+        recent_events = [
+            {
+                "timestamp": event.timestamp.isoformat(),
+                "source": event.source,
+                "type": event.type,
+                "payload": event.payload,
+            }
+            for event in self._events[-12:]
+        ]
+        return (
+            "You are a lawn irrigation planner. "
+            "Return only valid JSON with keys action, duration_seconds, rationale. "
+            "Allowed actions: water_on, water_off, no_op, notify.\n\n"
+            f"Decision time: {now.isoformat()}\n"
+            f"Recent events: {json.dumps(recent_events, sort_keys=True)}"
+        )
