@@ -1,4 +1,4 @@
-# Structured Evaluation of Classical vs Neural Planners
+# Yard Irrigation Agent
 
 ## Overview
 
