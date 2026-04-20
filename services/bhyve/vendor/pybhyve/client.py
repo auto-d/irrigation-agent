@@ -1,10 +1,12 @@
 """Define an object to interact with the REST API."""
 
+import asyncio
 import logging
 import re
 import time
 
 from asyncio import ensure_future
+from aiohttp import ClientError
 
 from .const import (
     API_HOST,
@@ -68,14 +70,32 @@ class Client:
             "Chrome/72.0.3626.81 Safari/537.36"
         )
 
-        async with self._session.request(
-            method, url, params=params, headers=headers, json=json
-        ) as resp:
+        attempts = 3
+        last_error = None
+        for attempt in range(1, attempts + 1):
             try:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
+                async with self._session.request(
+                    method, url, params=params, headers=headers, json=json
+                ) as resp:
+                    resp.raise_for_status()
+                    return await resp.json(content_type=None)
+            except ClientError as err:
+                last_error = err
+                if attempt == attempts:
+                    break
+                _LOGGER.warning(
+                    "B-hyve request failed (%s %s), retrying %s/%s: %s",
+                    method,
+                    url,
+                    attempt,
+                    attempts,
+                    err,
+                )
+                await asyncio.sleep(0.5 * attempt)
             except Exception as err:
                 raise RequestError(f"Error requesting data from {url}: {err}")
+
+        raise RequestError(f"Error requesting data from {url}: {last_error}")
 
     async def _refresh_devices(self, force_update=False):
         now = time.time()

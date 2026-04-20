@@ -1,0 +1,132 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "CLI: Probe Services",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "probe",
+        "service",
+        "all",
+        "--infer-location"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Probe Perception",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "probe",
+        "perception",
+        "all",
+        "--infer-location"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Probe Camera Perceptor",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "probe",
+        "perception",
+        "camera",
+        "--camera-url",
+        "rtsps://camera.example.local:7441/your-stream-path",
+        "--sample-frames",
+        "3",
+        "--save-frame",
+        "${workspaceFolder}/debug/camera_probe.jpg"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Live Classical",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "run",
+        "--planner",
+        "classical",
+        "--infer-location",
+        "--ticks",
+        "1",
+        "--log-jsonl",
+        "${workspaceFolder}/debug/live_classical.jsonl"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Live Neural",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "run",
+        "--planner",
+        "neural",
+        "--infer-location",
+        "--ticks",
+        "1",
+        "--log-jsonl",
+        "${workspaceFolder}/debug/live_neural.jsonl"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Replay Classical",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "replay",
+        "--planner",
+        "classical",
+        "--log-jsonl",
+        "${workspaceFolder}/debug/replay_classical.jsonl"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: Replay Neural",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_cli.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "replay",
+        "--planner",
+        "neural",
+        "--log-jsonl",
+        "${workspaceFolder}/debug/replay_neural.jsonl"
+      ],
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    }
+  ]
+}

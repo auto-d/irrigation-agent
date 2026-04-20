@@ -13,7 +13,7 @@ import json
 from typing import Any, Dict, List
 
 from classical_agent import ClassicalPlanner
-from planner import Decision, Event
+from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
 
 class Backend(): 
     """
@@ -362,7 +362,7 @@ class NeuralPlanner(LlmAgent):
         #result = "\n".join(text).strip()
 
 
-class NeuralMvpPlanner:
+class NeuralMvpPlanner(BasePlanner):
     """Small planner adapter for the MVP CLI.
 
     If `OPENAI_API_KEY` is available, this planner asks an LLM to emit a JSON
@@ -373,23 +373,51 @@ class NeuralMvpPlanner:
     name = "neural"
 
     def __init__(self, api_key: str | None = None) -> None:
+        super().__init__()
         self._events: List[Event] = []
         self._fallback = ClassicalPlanner()
         self._api_key = api_key or os.getenv("OPENAI_API_KEY")
         self._backend = Backend(self._api_key, model="gpt-5.4-mini") if self._api_key else None
 
-    def observe(self, event: Event) -> None:
-        self._events.append(event)
-        self._fallback.observe(event)
-
-    def decide(self, now: dt.datetime) -> Decision:
+    async def run(self, proxy: PlannerProxy, *, now: dt.datetime) -> PlannerRunResult:
+        events = [
+            await proxy.perceive("weather"),
+            await proxy.perceive("precipitation"),
+            await proxy.perceive("irrigation"),
+            await proxy.perceive("camera"),
+        ]
+        self._events.extend(events)
+        weather, precipitation, irrigation, camera = events
         if self._backend is None:
-            decision = self._fallback.decide(now)
+            decision = self._fallback.decision_from_events(
+                now,
+                weather=weather,
+                precipitation=precipitation,
+                irrigation=irrigation,
+                camera=camera,
+            )
             decision.planner = self.name
             decision.metadata["fallback"] = "no_api_key"
-            return decision
+            action_count = 0
+            if decision.action == "water_on":
+                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
+                action_count += 1
+            elif decision.action == "water_off":
+                await proxy.act("irrigation", "water_off")
+                action_count += 1
+            elif decision.action == "notify":
+                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
+                action_count += 1
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=len(events),
+                action_count=action_count,
+            )
 
-        prompt = self._decision_prompt(now)
+        prompt = self._decision_prompt(now, events)
         try:
             response = self._backend.send(
                 [
@@ -402,7 +430,7 @@ class NeuralMvpPlanner:
             text_chunks, _ = self._backend.unpack_response(response)
             content = "\n".join(text_chunks).strip()
             parsed = json.loads(content)
-            return Decision(
+            decision = Decision(
                 timestamp=now,
                 planner=self.name,
                 action=parsed.get("action", "no_op"),
@@ -410,13 +438,54 @@ class NeuralMvpPlanner:
                 rationale=parsed.get("rationale", "No rationale provided."),
                 metadata={"raw_response": content},
             )
+            action_count = 0
+            if decision.action == "water_on":
+                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
+                action_count += 1
+            elif decision.action == "water_off":
+                await proxy.act("irrigation", "water_off")
+                action_count += 1
+            elif decision.action == "notify":
+                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
+                action_count += 1
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=len(events),
+                action_count=action_count,
+            )
         except Exception as err:
-            decision = self._fallback.decide(now)
+            decision = self._fallback.decision_from_events(
+                now,
+                weather=weather,
+                precipitation=precipitation,
+                irrigation=irrigation,
+                camera=camera,
+            )
             decision.planner = self.name
             decision.metadata["fallback"] = f"backend_error:{type(err).__name__}"
-            return decision
+            action_count = 0
+            if decision.action == "water_on":
+                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
+                action_count += 1
+            elif decision.action == "water_off":
+                await proxy.act("irrigation", "water_off")
+                action_count += 1
+            elif decision.action == "notify":
+                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
+                action_count += 1
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=len(events),
+                action_count=action_count,
+            )
 
-    def _decision_prompt(self, now: dt.datetime) -> str:
+    def _decision_prompt(self, now: dt.datetime, events: List[Event]) -> str:
         recent_events = [
             {
                 "timestamp": event.timestamp.isoformat(),
@@ -424,7 +493,7 @@ class NeuralMvpPlanner:
                 "type": event.type,
                 "payload": event.payload,
             }
-            for event in self._events[-12:]
+            for event in (self._events[-8:] + events)[-12:]
         ]
         return (
             "You are a lawn irrigation planner. "

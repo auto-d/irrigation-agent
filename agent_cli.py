@@ -8,28 +8,11 @@ import asyncio
 import datetime as dt
 import json
 from dataclasses import asdict, is_dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any
 
 from classical_agent import ClassicalPlanner
 from neural_agent import NeuralMvpPlanner
-from perception import (
-    ForecastPerceptor,
-    HistoricalPrecipitationPerceptor,
-    IrrigationPerceptor,
-    SecurityCameraPerceptor,
-)
-from planner import (
-    ActionResult,
-    Decision,
-    Event,
-    action_result_to_dict,
-    append_jsonl,
-    decision_to_dict,
-    event_from_dict,
-    event_to_dict,
-)
-from services.bhyve.controller import controller_from_env
+from planner import PerceptionConfig, PlannerExecutor, ServicePerceptionProxy
 
 
 def _jsonable(value: Any) -> Any:
@@ -44,20 +27,6 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-async def _resolve_lat_lon(args: argparse.Namespace) -> tuple[float, float] | None:
-    if args.lat is not None and args.lon is not None:
-        return (args.lat, args.lon)
-
-    if getattr(args, "infer_location", False):
-        async with controller_from_env() as controller:
-            sprinkler = controller.list_sprinkler_devices()[0]
-            location = sprinkler.get("location", {})
-            coords = location.get("coordinates", [])
-            if len(coords) == 2:
-                return (float(coords[1]), float(coords[0]))
-    return None
-
-
 def _build_planner(name: str):
     if name == "classical":
         return ClassicalPlanner()
@@ -66,198 +35,18 @@ def _build_planner(name: str):
     raise ValueError(f"Unsupported planner: {name}")
 
 
-async def _probe_service(args: argparse.Namespace) -> Dict[str, Any]:
-    results: Dict[str, Any] = {}
-    location = await _resolve_lat_lon(args)
-
-    if args.target in {"weather", "all"}:
-        if location is None:
-            results["weather"] = {"error": "latitude/longitude unavailable"}
-        else:
-            results["weather"] = await ForecastPerceptor().probe_raw(
-                *location,
-                hours=args.forecast_hours,
-                days=args.forecast_days,
-            )
-
-    if args.target in {"precipitation", "all"}:
-        results["precipitation"] = await HistoricalPrecipitationPerceptor().probe_raw(args.window)
-
-    if args.target in {"irrigation", "all"}:
-        results["irrigation"] = await IrrigationPerceptor().probe_raw()
-
-    if args.target in {"camera", "all"}:
-        if not args.camera_url:
-            results["camera"] = {"error": "camera URL required"}
-        else:
-            results["camera"] = SecurityCameraPerceptor().probe_raw(
-                args.camera_url,
-                sample_frames=args.sample_frames,
-                save_frame_path=args.save_frame,
-            )
-
-    return results
-
-
-async def _probe_perception(args: argparse.Namespace) -> Dict[str, Any]:
-    results: Dict[str, Any] = {}
-    location = await _resolve_lat_lon(args)
-
-    if args.target in {"weather", "all"}:
-        if location is None:
-            results["weather"] = {"error": "latitude/longitude unavailable"}
-        else:
-            event = await ForecastPerceptor().perceive(
-                *location,
-                hours=args.forecast_hours,
-                days=args.forecast_days,
-            )
-            results["weather"] = event_to_dict(event)
-
-    if args.target in {"precipitation", "all"}:
-        event = await HistoricalPrecipitationPerceptor().perceive(args.window)
-        results["precipitation"] = event_to_dict(event)
-
-    if args.target in {"irrigation", "all"}:
-        event = await IrrigationPerceptor().perceive()
-        results["irrigation"] = event_to_dict(event)
-
-    if args.target in {"camera", "all"}:
-        if not args.camera_url:
-            results["camera"] = {"error": "camera URL required"}
-        else:
-            event = SecurityCameraPerceptor().perceive(
-                args.camera_url,
-                sample_frames=args.sample_frames,
-                save_frame_path=args.save_frame,
-            )
-            results["camera"] = event_to_dict(event)
-
-    return results
-
-
-async def _collect_perception_events(args: argparse.Namespace) -> List[Event]:
-    events: List[Event] = []
-    location = await _resolve_lat_lon(args)
-
-    if location is not None:
-        events.append(
-            await ForecastPerceptor().perceive(
-                *location,
-                hours=args.forecast_hours,
-                days=args.forecast_days,
-            )
-        )
-
-    events.append(await HistoricalPrecipitationPerceptor().perceive(args.window))
-    events.append(await IrrigationPerceptor().perceive())
-
-    if args.camera_url:
-        events.append(SecurityCameraPerceptor().perceive(args.camera_url, sample_frames=args.sample_frames))
-
-    return events
-
-
-async def _emit_action(decision: Decision, *, execute_actions: bool) -> ActionResult:
-    now = dt.datetime.now(dt.timezone.utc)
-
-    if not execute_actions:
-        return ActionResult(
-            timestamp=now,
-            action=decision.action,
-            status="dry_run",
-            detail={"reason": "action emission disabled"},
-        )
-
-    if decision.action == "water_on":
-        async with controller_from_env() as controller:
-            sprinkler = controller.list_sprinkler_devices()[0]
-            result = await controller.turn_on(
-                str(sprinkler["id"]),
-                seconds=float(decision.duration_seconds or 300),
-            )
-        return ActionResult(
-            timestamp=now,
-            action=decision.action,
-            status="executed",
-            detail={"result": result},
-        )
-
-    if decision.action == "water_off":
-        async with controller_from_env() as controller:
-            sprinkler = controller.list_sprinkler_devices()[0]
-            result = await controller.turn_off(str(sprinkler["id"]))
-        return ActionResult(
-            timestamp=now,
-            action=decision.action,
-            status="executed",
-            detail={"result": result},
-        )
-
-    return ActionResult(
-        timestamp=now,
-        action=decision.action,
-        status="dry_run",
-        detail={"reason": "no external action required"},
+def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
+    return PerceptionConfig(
+        lat=args.lat,
+        lon=args.lon,
+        infer_location=getattr(args, "infer_location", False),
+        forecast_hours=getattr(args, "forecast_hours", None),
+        forecast_days=getattr(args, "forecast_days", None),
+        precipitation_window=getattr(args, "window", "24H"),
+        camera_url=getattr(args, "camera_url", None),
+        sample_frames=getattr(args, "sample_frames", 3),
+        save_frame=getattr(args, "save_frame", None),
     )
-
-
-def _append_records(log_path: str | None, records: Iterable[tuple[str, Dict[str, Any]]]) -> None:
-    if not log_path:
-        return
-    for record_type, payload in records:
-        append_jsonl(log_path, record_type, payload)
-
-
-async def _run_live(args: argparse.Namespace) -> None:
-    planner = _build_planner(args.planner)
-    tick_count = args.ticks if args.ticks is not None else max(1, int(args.duration_seconds / args.tick_seconds))
-
-    for tick_index in range(tick_count):
-        events = await _collect_perception_events(args)
-        tick_event = Event(
-            timestamp=dt.datetime.now(dt.timezone.utc),
-            source="runtime",
-            type="tick",
-            payload={"tick_index": tick_index},
-        )
-        events.append(tick_event)
-
-        for event in events:
-            planner.observe(event)
-            _append_records(args.log_jsonl, [("event", {"event": event_to_dict(event)})])
-
-        decision = planner.decide(tick_event.timestamp)
-        print(json.dumps({"decision": decision_to_dict(decision)}, indent=2, sort_keys=True))
-        _append_records(args.log_jsonl, [("decision", {"decision": decision_to_dict(decision)})])
-
-        result = await _emit_action(decision, execute_actions=args.execute_actions)
-        print(json.dumps({"action_result": action_result_to_dict(result)}, indent=2, sort_keys=True))
-        _append_records(
-            args.log_jsonl,
-            [("action_result", {"action_result": action_result_to_dict(result)})],
-        )
-
-        if tick_index != tick_count - 1:
-            await asyncio.sleep(args.tick_seconds)
-
-
-async def _run_replay(args: argparse.Namespace) -> None:
-    planner = _build_planner(args.planner)
-    records = Path(args.log_jsonl).read_text(encoding="utf-8").splitlines()
-    for line in records:
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get("record_type") != "event":
-            continue
-        event = event_from_dict(record["event"])
-        planner.observe(event)
-        if event.type == "tick":
-            decision = planner.decide(event.timestamp)
-            print(json.dumps({"decision": decision_to_dict(decision)}, indent=2, sort_keys=True))
-            result = await _emit_action(decision, execute_actions=args.execute_actions)
-            print(json.dumps({"action_result": action_result_to_dict(result)}, indent=2, sort_keys=True))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -330,16 +119,35 @@ async def _main_async(args: argparse.Namespace) -> int:
         if args.forecast_hours is not None and args.forecast_days is not None:
             raise SystemExit("Specify either --forecast-hours or --forecast-days, not both.")
     if args.command == "probe" and args.probe_target == "service":
-        print(json.dumps(_jsonable(await _probe_service(args)), indent=2, sort_keys=True))
+        proxy = ServicePerceptionProxy(_perception_config_from_args(args))
+        print(json.dumps(_jsonable(await proxy.probe_services(args.target)), indent=2, sort_keys=True))
         return 0
     if args.command == "probe" and args.probe_target == "perception":
-        print(json.dumps(_jsonable(await _probe_perception(args)), indent=2, sort_keys=True))
+        proxy = ServicePerceptionProxy(_perception_config_from_args(args))
+        print(json.dumps(_jsonable(await proxy.probe_perception(args.target)), indent=2, sort_keys=True))
         return 0
     if args.command == "run":
-        await _run_live(args)
+        planner = _build_planner(args.planner)
+        executor = PlannerExecutor(
+            planner=planner,
+            perception_proxy=ServicePerceptionProxy(_perception_config_from_args(args)),
+            log_jsonl=args.log_jsonl,
+        )
+        tick_count = args.ticks if args.ticks is not None else max(1, int(args.duration_seconds / args.tick_seconds))
+        results = await executor.run(
+            tick_count=tick_count,
+            tick_seconds=args.tick_seconds,
+            execute_actions=args.execute_actions,
+        )
+        for result in results:
+            print(json.dumps({"planner_run": result}, indent=2, sort_keys=True))
         return 0
     if args.command == "replay":
-        await _run_replay(args)
+        planner = _build_planner(args.planner)
+        executor = PlannerExecutor(planner=planner)
+        results = await executor.replay(args.log_jsonl, execute_actions=args.execute_actions)
+        for result in results:
+            print(json.dumps({"planner_run": result}, indent=2, sort_keys=True))
         return 0
     raise SystemExit(f"Unsupported command: {args.command}")
 

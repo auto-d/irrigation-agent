@@ -1,6 +1,8 @@
 .DS_Store
 debug_frames/
+debug/
 .env
 .venv/
 venv/
 __pycache__/
+*.jsonl
