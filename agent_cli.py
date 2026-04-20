@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified MVP CLI for probing services, probing perception, running, and replaying."""
+"""CLI entrypoint for service probes, planner runs, and replay."""
 
 from __future__ import annotations
 
@@ -11,11 +11,12 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from classical_agent import ClassicalPlanner
-from neural_agent import NeuralMvpPlanner
+from neural_agent import NeuralPlanner
 from planner import PerceptionConfig, PlannerExecutor, ServicePerceptionProxy
 
 
 def _jsonable(value: Any) -> Any:
+    """Normalize dataclasses and datetimes for JSON output."""
     if is_dataclass(value):
         return _jsonable(asdict(value))
     if isinstance(value, dt.datetime):
@@ -28,14 +29,16 @@ def _jsonable(value: Any) -> Any:
 
 
 def _build_planner(name: str):
+    """Construct a planner from its CLI name."""
     if name == "classical":
         return ClassicalPlanner()
     if name == "neural":
-        return NeuralMvpPlanner()
+        return NeuralPlanner()
     raise ValueError(f"Unsupported planner: {name}")
 
 
 def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
+    """Translate CLI flags into shared perceptor configuration."""
     return PerceptionConfig(
         lat=args.lat,
         lon=args.lon,
@@ -115,6 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
+    """Dispatch one CLI command."""
     if hasattr(args, "forecast_hours") and hasattr(args, "forecast_days"):
         if args.forecast_hours is not None and args.forecast_days is not None:
             raise SystemExit("Specify either --forecast-hours or --forecast-days, not both.")
@@ -153,6 +157,7 @@ async def _main_async(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """Run the CLI synchronously."""
     parser = _build_parser()
     args = parser.parse_args()
     if not args.command:

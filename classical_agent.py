@@ -13,6 +13,8 @@ from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
 
 @dataclass(frozen=True)
 class WorldState:
+    """Condensed planner inputs for one behavior-tree tick."""
+
     irrigation: Dict[str, Any]
     precipitation: Dict[str, Any]
     forecast: Dict[str, Any]
@@ -21,6 +23,8 @@ class WorldState:
 
 @dataclass(frozen=True)
 class TreeOutcome:
+    """Behavior-tree leaf output before normalization to a Decision."""
+
     action: str
     rationale: str
     metadata: Dict[str, Any]
@@ -33,6 +37,8 @@ class ClassicalPlanner(BasePlanner):
     name = "classical"
 
     class WorldStateCondition(py_trees.behaviour.Behaviour):
+        """Leaf that checks one predicate against the current world state."""
+
         def __init__(
             self,
             *,
@@ -54,6 +60,8 @@ class ClassicalPlanner(BasePlanner):
             return py_trees.common.Status.FAILURE
 
     class DefaultOutcome(py_trees.behaviour.Behaviour):
+        """Leaf that always selects the fallback outcome."""
+
         def __init__(self, *, blackboard: py_trees.blackboard.Client, outcome: TreeOutcome) -> None:
             super().__init__(name="DefaultWaterOn")
             self.blackboard = blackboard
@@ -72,6 +80,8 @@ class ClassicalPlanner(BasePlanner):
         self._tree.setup()
 
     async def run(self, proxy: PlannerProxy, *, now: datetime) -> PlannerRunResult:
+        # The classical planner is intentionally explicit here: fetch a small,
+        # fixed set of perceptions, run the tree once, then emit at most one action.
         weather = await proxy.perceive("weather")
         precipitation = await proxy.perceive("precipitation")
         irrigation = await proxy.perceive("irrigation")
@@ -113,6 +123,7 @@ class ClassicalPlanner(BasePlanner):
         irrigation: Event,
         camera: Event,
     ) -> Decision:
+        """Compute one decision from already-materialized perception events."""
         self._blackboard.world_state = WorldState(
             irrigation=irrigation.payload,
             precipitation=precipitation.payload,
@@ -134,6 +145,7 @@ class ClassicalPlanner(BasePlanner):
         )
 
     def _build_tree(self) -> py_trees.behaviour.Behaviour:
+        """Build the small policy tree used for the MVP planner."""
         root = py_trees.composites.Selector(name="IrrigationDecision", memory=False)
         root.add_children(
             [

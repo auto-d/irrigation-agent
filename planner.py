@@ -1,11 +1,4 @@
-"""
-Planner abstraction - contracts, runtime executor, and record/playback helpers.
-
-This feels right to collocate in the same source file since the Planner abstract 
-base is directly employed in the executor, and the scaffolding around it (planner) 
-is required for us to smoothly handle normal execution and the replay mode where 
-we build up a fake scenario around the planner. 
-"""
+"""Planner contracts, runtime executor, and replay helpers."""
 
 from __future__ import annotations
 
@@ -101,6 +94,8 @@ class PlannerRunResult:
 
 
 class PlannerProxy(Protocol):
+    """Runtime surface planners use to solicit perception and emit actions."""
+
     async def perceive(self, perceptor: str, **kwargs: Any) -> Event:
         """Fetch one normalized perception event."""
 
@@ -109,6 +104,8 @@ class PlannerProxy(Protocol):
 
 
 class Actor(Protocol):
+    """Executable action target used by the runtime."""
+
     name: str
 
     async def execute(self, action: str, **kwargs: Any) -> ActionResult:
@@ -138,24 +135,28 @@ class BasePlanner(ABC):
 
 
 def event_to_dict(event: Event) -> Dict[str, Any]:
+    """Serialize an Event for JSONL logging."""
     payload = asdict(event)
     payload["timestamp"] = event.timestamp.isoformat()
     return payload
 
 
 def decision_to_dict(decision: Decision) -> Dict[str, Any]:
+    """Serialize a Decision for JSONL logging."""
     payload = asdict(decision)
     payload["timestamp"] = decision.timestamp.isoformat()
     return payload
 
 
 def perception_request_to_dict(request: PerceptionRequest) -> Dict[str, Any]:
+    """Serialize a PerceptionRequest for JSONL logging."""
     payload = asdict(request)
     payload["timestamp"] = request.timestamp.isoformat()
     return payload
 
 
 def perception_result_to_dict(result: PerceptionResult) -> Dict[str, Any]:
+    """Serialize a PerceptionResult for JSONL logging."""
     payload = {
         "timestamp": result.timestamp.isoformat(),
         "planner": result.planner,
@@ -166,18 +167,21 @@ def perception_result_to_dict(result: PerceptionResult) -> Dict[str, Any]:
 
 
 def action_request_to_dict(request: ActionRequest) -> Dict[str, Any]:
+    """Serialize an ActionRequest for JSONL logging."""
     payload = asdict(request)
     payload["timestamp"] = request.timestamp.isoformat()
     return payload
 
 
 def action_result_to_dict(result: ActionResult) -> Dict[str, Any]:
+    """Serialize an ActionResult for JSONL logging."""
     payload = asdict(result)
     payload["timestamp"] = result.timestamp.isoformat()
     return payload
 
 
 def planner_run_result_to_dict(result: PlannerRunResult) -> Dict[str, Any]:
+    """Serialize a PlannerRunResult for JSONL logging."""
     return {
         "timestamp": result.timestamp.isoformat(),
         "planner": result.planner,
@@ -189,12 +193,14 @@ def planner_run_result_to_dict(result: PlannerRunResult) -> Dict[str, Any]:
 
 
 def event_from_dict(payload: Dict[str, Any]) -> Event:
+    """Deserialize a logged event."""
     data = dict(payload)
     data["timestamp"] = datetime.fromisoformat(data["timestamp"])
     return Event(**data)
 
 
 def append_jsonl(path: str | Path, record_type: str, payload: Dict[str, Any]) -> None:
+    """Append one record to a JSONL log, creating parent directories as needed."""
     record = {"record_type": record_type, **payload}
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +210,8 @@ def append_jsonl(path: str | Path, record_type: str, payload: Dict[str, Any]) ->
 
 @dataclass(frozen=True)
 class PerceptionConfig:
+    """Shared configuration for service-backed perceptors."""
+
     lat: float | None = None
     lon: float | None = None
     infer_location: bool = False
@@ -263,6 +271,7 @@ class ServicePerceptionProxy:
         return results
 
     async def probe_perception(self, target: str) -> Dict[str, Any]:
+        """Run one or more perceptors and return normalized events."""
         results: Dict[str, Any] = {}
         for perceptor in self._targets_to_perceptors(target):
             try:
@@ -274,6 +283,7 @@ class ServicePerceptionProxy:
         return results
 
     async def perceive(self, perceptor: str, **kwargs: Any) -> Event:
+        """Dispatch one named perceptor."""
         from perception import (
             ForecastPerceptor,
             HistoricalPrecipitationPerceptor,
@@ -307,6 +317,7 @@ class ServicePerceptionProxy:
         raise ValueError(f"Unknown perceptor: {perceptor}")
 
     def _merge_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Overlay per-call overrides on top of the shared config."""
         return {
             "forecast_hours": kwargs.get("forecast_hours", self._config.forecast_hours),
             "forecast_days": kwargs.get("forecast_days", self._config.forecast_days),
@@ -317,11 +328,13 @@ class ServicePerceptionProxy:
         }
 
     def _targets_to_perceptors(self, target: str) -> List[str]:
+        """Expand CLI target names to concrete perceptors."""
         if target == "all":
             return ["weather", "precipitation", "irrigation", "camera"]
         return [target]
 
     async def _resolve_lat_lon(self) -> tuple[float, float] | None:
+        """Resolve coordinates from flags or the configured B-hyve device."""
         if self._config.lat is not None and self._config.lon is not None:
             return (self._config.lat, self._config.lon)
 
@@ -339,6 +352,8 @@ class ServicePerceptionProxy:
 
 
 class IrrigationActor:
+    """Actor that controls the B-hyve hose timer."""
+
     name = "irrigation"
 
     async def execute(self, action: str, **kwargs: Any) -> ActionResult:
@@ -373,6 +388,8 @@ class IrrigationActor:
 
 
 class NotificationActor:
+    """Placeholder actor for planner notifications."""
+
     name = "notification"
 
     async def execute(self, action: str, **kwargs: Any) -> ActionResult:
@@ -418,6 +435,8 @@ class LiveExecutorProxy:
             kwargs=kwargs,
         )
         self._append("perception_request", {"perception_request": perception_request_to_dict(request)})
+        # The planner asks for a named perceptor; the live proxy records the
+        # request/result pair so the same episode can be replayed later.
         event = await self._perceptors[perceptor].perceive(perceptor, **kwargs)
         result = PerceptionResult(
             timestamp=dt.datetime.now(dt.timezone.utc),
@@ -471,6 +490,8 @@ class ReplayExecutorProxy:
         self.action_count = 0
 
     async def perceive(self, perceptor: str, **kwargs: Any) -> Event:
+        # Replay is strict about call order so planner behavior remains
+        # comparable between live execution and offline evaluation.
         request_record = self._next_record("perception_request")
         request = request_record["perception_request"]
         if request["perceptor"] != perceptor:
@@ -564,6 +585,7 @@ class PlannerExecutor:
         return results
 
     async def replay(self, log_jsonl: str, *, execute_actions: bool) -> List[Dict[str, Any]]:
+        """Replay each logged tick as one planner episode."""
         records = [
             json.loads(line)
             for line in Path(log_jsonl).read_text(encoding="utf-8").splitlines()

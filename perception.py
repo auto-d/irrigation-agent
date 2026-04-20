@@ -19,6 +19,7 @@ from services.weather import Forecast, WeatherClient
 
 
 def _now() -> dt.datetime:
+    """Return the current UTC timestamp."""
     return dt.datetime.now(dt.timezone.utc)
 
 
@@ -38,6 +39,7 @@ class ForecastPerceptor:
         hours: int | None = 12,
         days: int | None = None,
     ) -> Dict[str, Any]:
+        """Return raw forecast payloads plus the selected planning window."""
         async with WeatherClient.from_env() as client:
             point = await client.fetch_point(latitude, longitude)
             forecast = await self._fetch_forecast(
@@ -63,6 +65,7 @@ class ForecastPerceptor:
         hours: int | None = 12,
         days: int | None = None,
     ) -> Event:
+        """Return one normalized weather event."""
         async with WeatherClient.from_env() as client:
             forecast = await self._fetch_forecast(
                 client,
@@ -95,6 +98,8 @@ class ForecastPerceptor:
         hours: int | None,
         days: int | None,
     ) -> Event:
+        # Integrate precipitation probability over the requested window rather
+        # than reducing the forecast to a single point estimate.
         next_periods = self._select_periods(forecast, hours=hours, days=days)
         precip_probs = [
             period.probability_of_precipitation
@@ -190,6 +195,7 @@ class HistoricalPrecipitationPerceptor:
     """Fetch and condense precipitation historicals into a planner-facing event."""
 
     async def probe_raw(self, window: str) -> Dict[str, Any]:
+        """Return raw precipitation records and the derived summary."""
         async with PrecipitationClient.from_env() as client:
             raw = await client.fetch_raw(window)
             summary = await client.summarize(window)
@@ -205,6 +211,7 @@ class HistoricalPrecipitationPerceptor:
         }
 
     async def perceive(self, window: str) -> Event:
+        """Return one normalized precipitation event."""
         async with PrecipitationClient.from_env() as client:
             summary = await client.summarize(window)
         return self._summary_event(summary)
@@ -230,6 +237,7 @@ class IrrigationPerceptor:
     """Fetch and condense irrigation controller state into a planner-facing event."""
 
     async def probe_raw(self) -> Dict[str, Any]:
+        """Return the full controller payloads used during troubleshooting."""
         async with controller_from_env() as controller:
             devices = controller.get_devices()
             sprinkler = controller.list_sprinkler_devices()[0]
@@ -243,6 +251,7 @@ class IrrigationPerceptor:
         }
 
     async def perceive(self) -> Event:
+        """Return one normalized irrigation-status event."""
         async with controller_from_env() as controller:
             sprinkler = controller.list_sprinkler_devices()[0]
             programs = controller.get_programs(str(sprinkler["id"]))
@@ -250,6 +259,8 @@ class IrrigationPerceptor:
 
     def _irrigation_event(self, sprinkler: Dict[str, Any], programs: List[Dict[str, Any]]) -> Event:
         now_local = dt.datetime.now().astimezone()
+        # The API status is not reliable on its own for the hose timer, so we
+        # also derive whether the device should be running from local schedules.
         expected_on, matching_programs = self._expected_programs_now(programs, now_local)
         status = sprinkler.get("status") or {}
         payload = {
@@ -310,6 +321,7 @@ class SecurityCameraPerceptor:
         sample_frames: int = 1,
         save_frame_path: str | None = None,
     ) -> Dict[str, Any]:
+        """Return inexpensive stream metadata and sampled frame statistics."""
         stream_info = ffprobe_stream_info(url)
         stats, capture_info = self._sample_frame_stats(
             url,
@@ -332,6 +344,7 @@ class SecurityCameraPerceptor:
         sample_frames: int = 3,
         save_frame_path: str | None = None,
     ) -> Event:
+        """Return one normalized camera scene event."""
         stream_info = ffprobe_stream_info(url)
         stats, capture_info = self._sample_frame_stats(
             url,
@@ -365,6 +378,7 @@ class SecurityCameraPerceptor:
         sample_frames: int,
         save_frame_path: str | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Collect lightweight frame metrics without downstream inference."""
         stats: List[Dict[str, Any]] = []
         previous_gray = None
         saved_frame_path: str | None = None

@@ -1,12 +1,9 @@
-"""
-Scratch-built agent framework to demonstrate the underlying abstractions
-
-NOTE: Backend, Tool, Agent classes refactored from auto-d/voice-agent/agent.py
-"""
+"""LLM-backed planner and tool scaffolding."""
 
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import os
 from copy import deepcopy
 import json 
@@ -16,16 +13,10 @@ from classical_agent import ClassicalPlanner
 from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
 
 class Backend(): 
-    """
-    Class to abstract a backend, allows us to use one shape and rotate backend LLMs
-    (to a degree) without changing agent logic. This can become an abstract base as 
-    needed. 
-    """
+    """Thin wrapper over the Responses API."""
 
     def __init__(self, api_key, model="gpt-5.4", reasoning={"effort": "low"}): 
-        """
-        Create a backend model abstraction that simplifies text completions
-        """
+        """Create a backend model abstraction."""
         try:
             from openai import OpenAI
         except ImportError as err:
@@ -37,16 +28,12 @@ class Backend():
         self.reasoning = reasoning
 
     def clone(self):
-        """
-        Create a deep copy of this instance 
-        """
+        """Create a deep copy of this instance."""
         new = Backend(self.api_key, self.model, self.reasoning)
         return new 
 
     def send(self, messages, instructions=None, tools=None): 
-        """
-        Send provided messages to the backend 
-        """
+        """Send the current conversation to the backend."""
         response = self.client.responses.create(
             model=self.model,
             #instructions=None, 
@@ -58,9 +45,7 @@ class Backend():
         return response
     
     def unpack_response(self, response, include_reasoning=False): 
-        """
-        Unpack and validate response, return plain language and any tool calls as arrays.
-        """
+        """Return plain text chunks and any tool calls."""
 
         text = [] 
         tool_calls = []
@@ -88,51 +73,35 @@ class Backend():
         return text, tool_calls 
 
 class Memory(): 
-    """
-    Chat history with automatic summarization on demand
-    """
+    """Conversation state for one planner run."""
     def __init__(self, backend=None): 
         self.backend = backend
         self.messages = []
 
     def clone(self):
-        """
-        Create a duplicate of this instance
-        """
+        """Create a duplicate of this instance."""
         new = Memory()
         new.backend = self.backend.clone() 
         new.messages = deepcopy(self.messages)
         return new 
     
     def append_developer(self, messages=[]): 
-        """
-        Add some new developer/system messages... 
-        """        
+        """Append developer messages."""        
         new = [ {"role": "developer", "content": msg} for msg in messages ]
         self.messages.extend(new)
 
     def append_user(self, messages=[]): 
-        """
-        Add some new messages
-        """        
+        """Append user messages."""        
         new = [ {"role": "user", "content": msg} for msg in messages ]
         self.messages.extend(new)
 
     def append_assistant(self, messages=[]): 
-        """
-        Add some new messages
-        """        
+        """Append assistant messages."""        
         new = [ {"role": "assistant", "content": msg} for msg in messages ]
         self.messages.extend(new)
 
     def append_response_output(self, responses=[]):
-        """
-        Append raw responses output... this is a bit confusing, the old completions 
-        API had a format we were using prior, but the new Responses API seems to just 
-        want these items reflected back when we're managing the message history.
-
-        NOTE: Reflection syntax with help from gpt-5.4
-        """
+        """Append raw response objects in Responses API format."""
         for response in responses:
             if isinstance(response, dict):
                 payload = deepcopy(response)
@@ -141,17 +110,14 @@ class Memory():
             else:
                 payload = deepcopy(response.__dict__)
 
-            # TODO: this is a workaround, we are including status for our telemetry but 
-            # can't emit this to openAI... needs to be refactored. 
+            # Responses history rejects the telemetry-only status field.
             if isinstance(payload, dict) and "status" in payload:
                 del payload["status"]
 
             self.messages.append(payload)
 
     def append_tool_results(self, results=[]): 
-        """
-        Add tool call results in Responses API `function_call_output` form.
-        """
+        """Append tool call results in `function_call_output` form."""
         new = [
             {
                 "type": "function_call_output",
@@ -163,19 +129,14 @@ class Memory():
         self.messages.extend(new)
 
     def summarize(self): 
-        """
-        """
+        """Summarize memory."""
         if self.backend is None: 
             raise ValueError("Summarization requested but no backend configured!")
         
-        #TODO summarize! clients will want this e.g. for capturing history without clogging future contexts
         raise NotImplementedError()
     
 class Tool(): 
-    """
-    Abstract the notion of an LLM tool and provide some minimal validation 
-    to catch dumb mistakes. 
-    """
+    """Base type for planner tools."""
     MINIMAL = {
         "type": "function",
         "name": None,
@@ -186,18 +147,20 @@ class Tool():
     }
 
     def __init__(self): 
-        """
-        Initialize with a full openAI tool schema. Derived classes must set the `schema`
-        property on their instance before initialization of the parent (this class)
-        """
-        #TODO: this implicit relationship of the `schema` property is a little dicey, refactor
+        """Initialize the tool from its declared schema."""
         Tool.validate(Tool.MINIMAL, self.schema)
+
+    def emit_telemetry(self, instance=None, event=None, text=None, data=None):
+        """Placeholder telemetry hook."""
+        return None
+
+    def build_result(self, call_id, status, result):
+        """Build a standard tool result payload."""
+        return {"call_id": call_id, "status": status, "result": result}
 
     @classmethod 
     def validate(cls, src, target): 
-        """
-        Confirm the second object is a subset of the first 
-        """
+        """Confirm the second object is a subset of the first."""
         if isinstance(src, dict):
             for k,v in src.items(): 
                 if k not in target.keys(): 
@@ -205,64 +168,23 @@ class Tool():
                 cls.validate(v, target[k])
 
     def validate_instance(self, instance): 
-        """
-        Validate a schema instance against the tool schema and return an object 
-        representing the parsed call arguments
-
-        NOTE: the OpenAI responses module returns tool calls as 
-        ResponseFunctionToolCall objects. The properties of this object are 
-        typically strings, not the objects we need to do real work. Hence the deserialization 
-        going on in this method. Here's an example instance: 
-        {
-            arguments: '{"repository_url": "https://github.com/auto-d/water-quality","tasks": ["pull_repository","summarize_changes"]"file_edits": [],"commit_message": "","ci_job_names": []}', 
-            call_id='call_8Q2gowqYYTedsf1gR4pB4I9F', 
-            name='devops_tool', 
-            type='function_call', 
-            id='fc_043f0121b4c343140069d01ae10b84819188525ee393f37e3a', 
-            namespace=None, 
-            status='completed'
-        }
-        """        
+        """Parse JSON arguments from a Responses API tool call."""        
         
         args = json.loads(instance.arguments) 
         print(f"Found {instance.type} {instance.name} with id {instance.id} (call ID: {instance.call_id})...")
         print("Arguments", args)
 
-        #TODO: validate the object against the schema
-
         return args
 
     def run(self, instance, callback=None):
-        """
-        Invoke this tool given the parameters in instance, which must adhere
-        to the tool schema. Derived classes should implement this to execute actual work. 
-
-        Optionally provide a callback to handle the implementation yourself.
-
-        Return an object here to simplify parsing by LLMs and derived classes. This serves
-        also to ensure we have a rich output to mine in our telemetry which will be central 
-        to evaluation. Schema: 
-        { 
-            "status": "ok" or similar string detailing result code 
-            "call_id": <tool-call id
-            "result" : { <tool-specific object> }
-        }
-
-        """
+        """Execute the tool call."""
         raise NotImplementedError("run() method is an abstract method!")
 
 class LlmAgent(): 
-    """
-    Abstract the generic notion of an LLM agent.
-    """
+    """Generic async LLM agent loop with tool support."""
 
-    def __init__(self, backend, cwd='.', persist=False, dev_msgs=[]): 
-        """
-        Create a new agent instance 
-        """
-        #TODO: decide whether these should be instantiated internally, acepting 
-        # as a param risks us sharing an instance which could result in some 
-        # unnecessary sharing of I/O etc. 
+    def __init__(self, backend=None, cwd='.', persist=False, dev_msgs=[]): 
+        """Create a new agent instance."""
         self.backend = backend 
         self.cwd = cwd
         self.persist = False
@@ -270,24 +192,15 @@ class LlmAgent():
         self.memory.append_developer(dev_msgs)
 
     def save(self, path): 
-        """
-        Persist agent configuration and state to disk 
-        """
+        """Persist agent configuration and state to disk."""
         pass 
 
     def load(self, path): 
-        """
-        Load an agent config off disk 
-        """
+        """Load an agent config off disk."""
         pass 
 
-    def chat(self, messages, tools=[], trace=False):
-        """
-        Send a message to the agent with the provided user messages. Passed messages should 
-        be text only and will be formatted internally before delivery to the backend. 
-
-        Returns the response text from the backing model. 
-        """
+    async def chat(self, messages, tools=[], trace=False):
+        """Send user messages to the backend and satisfy any returned tool calls."""
 
         self.memory.append_user(messages)
 
@@ -297,9 +210,6 @@ class LlmAgent():
         tool_schemas = [ x.schema for x in tools ]
         tool_map = { x.schema['name']: x for x in tools}
 
-        # Pass the conversation to the backing LLM, iterating over and executing 
-        # any returned tool calls until only a chat response come back (which will
-        # perhaps be the dominant case). 
         while True: 
             if trace: 
                 print("===============\n")
@@ -307,6 +217,9 @@ class LlmAgent():
                 print("Message history:\n",self.memory.messages)
                 print("Tool descriptions:\n", tool_schemas)
                 print("---------------\n")
+
+            if self.backend is None:
+                raise RuntimeError("chat() requested but no backend configured for this agent")
 
             response = self.backend.send(self.memory.messages, tools=tool_schemas)
             text, tool_calls = self.backend.unpack_response(response)
@@ -318,77 +231,261 @@ class LlmAgent():
             for call in tool_calls: 
                 tool = tool_map[call.name]
                 result = tool.run(call)
+                # Tool implementations can be sync or async.
+                if inspect.isawaitable(result):
+                    result = await result
                 self.memory.append_tool_results([result])
 
         return text
 
     def run(self): 
-        """
-        Run this agent -- all agents currently run on the invoking thread's context, which works well for the 
-        API-server as a proxy, but will degrade as the system grows. Eventually these will be durable and 
-        freestanding but not today. :D
-        """    
+        """Run the agent loop."""
         raise NotImplementedError("Agent loop is currently external to this instance!")
 
-class NeuralPlanner(LlmAgent): 
-    """
-    Execute planning duties leveraging an LLM backend
 
-    TODO: adapt to the neural planning task
-    """
-    
-    def __init__(self, backend, openai_api_key): 
-        """
-        Create an instance of our agent
-        """
-        super().__init__(backend=backend)
+class WeatherPerceptionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "perceive_weather",
+        "description": "Fetch a normalized weather forecast perception event.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "forecast_hours": {"type": "integer"},
+                "forecast_days": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+    }
 
-        self.cheap_backend = Backend(api_key=openai_api_key, model="gpt-5.4-mini", reasoning={ "effort": "low"} )
-        
-        # TODO: encode our actions as Tools and pass to the backend
-        # self.fetch_tool = SummarizePageTool(backend=self.cheap_backend)
+    def __init__(self, proxy: PlannerProxy, event_sink: List[Event]):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        self.event_sink = event_sink
+        super().__init__()
 
-    def run(self, callback=None):
-        """
-        Run the agent 
-        """
-        
-        prompt = f"Foo"
-       
-        # TODO: integrate planning! 
+    async def run(self, instance, callback=None):
+        arguments = self.validate_instance(instance)
+        event = await self.proxy.perceive("weather", **arguments)
+        self.event_sink.append(event)
+        return self.build_result(instance.call_id, "ok", {"event": self._event_to_result(event)})
 
-        #available_tools = [self.fetch_tool]
-        #text = self.chat([prompt], tools=available_tools)
-        #result = "\n".join(text).strip()
+    @staticmethod
+    def _event_to_result(event: Event) -> Dict[str, Any]:
+        return {
+            "timestamp": event.timestamp.isoformat(),
+            "source": event.source,
+            "type": event.type,
+            "payload": event.payload,
+            "event_id": event.event_id,
+        }
 
 
-class NeuralMvpPlanner(BasePlanner):
-    """Small planner adapter for the MVP CLI.
+class PrecipitationPerceptionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "perceive_precipitation",
+        "description": "Fetch a normalized precipitation-history perception event.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    }
 
-    If `OPENAI_API_KEY` is available, this planner asks an LLM to emit a JSON
-    decision. If the backend is unavailable or the response is malformed, it
-    falls back to the same heuristic policy used by the classical planner.
-    """
+    def __init__(self, proxy: PlannerProxy, event_sink: List[Event]):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        self.event_sink = event_sink
+        super().__init__()
+
+    async def run(self, instance, callback=None):
+        arguments = self.validate_instance(instance)
+        event = await self.proxy.perceive("precipitation", **arguments)
+        self.event_sink.append(event)
+        return self.build_result(instance.call_id, "ok", {"event": WeatherPerceptionTool._event_to_result(event)})
+
+
+class IrrigationPerceptionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "perceive_irrigation",
+        "description": "Fetch a normalized irrigation-status perception event.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(self, proxy: PlannerProxy, event_sink: List[Event]):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        self.event_sink = event_sink
+        super().__init__()
+
+    async def run(self, instance, callback=None):
+        self.validate_instance(instance)
+        event = await self.proxy.perceive("irrigation")
+        self.event_sink.append(event)
+        return self.build_result(instance.call_id, "ok", {"event": WeatherPerceptionTool._event_to_result(event)})
+
+
+class CameraPerceptionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "perceive_camera",
+        "description": "Fetch a normalized camera scene-activity perception event.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sample_frames": {"type": "integer"},
+                "save_frame": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(self, proxy: PlannerProxy, event_sink: List[Event]):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        self.event_sink = event_sink
+        super().__init__()
+
+    async def run(self, instance, callback=None):
+        arguments = self.validate_instance(instance)
+        event = await self.proxy.perceive("camera", **arguments)
+        self.event_sink.append(event)
+        return self.build_result(instance.call_id, "ok", {"event": WeatherPerceptionTool._event_to_result(event)})
+
+
+class IrrigationActionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "act_irrigation",
+        "description": "Actuate the irrigation actor.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["water_on", "water_off", "cycle"],
+                },
+                "duration_seconds": {"type": "integer"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(self, proxy: PlannerProxy):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        super().__init__()
+
+    async def run(self, instance, callback=None):
+        arguments = self.validate_instance(instance)
+        action = arguments.pop("action")
+        result = await self.proxy.act("irrigation", action, **arguments)
+        return self.build_result(
+            instance.call_id,
+            "ok",
+            {
+                "action_result": {
+                    "timestamp": result.timestamp.isoformat(),
+                    "actor": result.actor,
+                    "action": result.action,
+                    "status": result.status,
+                    "detail": result.detail,
+                }
+            },
+        )
+
+
+class NotificationActionTool(Tool):
+    TOOL_DESC = {
+        "type": "function",
+        "name": "act_notification",
+        "description": "Invoke the notification actor.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["send"]},
+                "message": {"type": "string"},
+            },
+            "required": ["action", "message"],
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(self, proxy: PlannerProxy):
+        self.schema = self.TOOL_DESC
+        self.proxy = proxy
+        super().__init__()
+
+    async def run(self, instance, callback=None):
+        arguments = self.validate_instance(instance)
+        action = arguments.pop("action")
+        result = await self.proxy.act("notification", action, **arguments)
+        return self.build_result(
+            instance.call_id,
+            "ok",
+            {
+                "action_result": {
+                    "timestamp": result.timestamp.isoformat(),
+                    "actor": result.actor,
+                    "action": result.action,
+                    "status": result.status,
+                    "detail": result.detail,
+                }
+            },
+        )
+
+class NeuralPlanner(LlmAgent, BasePlanner): 
+    """LLM-backed planner with a classical fallback."""
 
     name = "neural"
 
     def __init__(self, api_key: str | None = None) -> None:
-        super().__init__()
+        BasePlanner.__init__(self)
         self._events: List[Event] = []
         self._fallback = ClassicalPlanner()
         self._api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self._backend = Backend(self._api_key, model="gpt-5.4-mini") if self._api_key else None
+        backend = Backend(self._api_key, model="gpt-5.4-mini") if self._api_key else None
+        LlmAgent.__init__(
+            self,
+            backend=backend,
+            dev_msgs=[
+                (
+                    "You are an irrigation planning agent. Use the provided tools to gather only the "
+                    "information you need, then optionally invoke an action tool, and finally respond "
+                    "with compact JSON containing keys action, duration_seconds, rationale."
+                )
+            ],
+        )
 
     async def run(self, proxy: PlannerProxy, *, now: dt.datetime) -> PlannerRunResult:
-        events = [
-            await proxy.perceive("weather"),
-            await proxy.perceive("precipitation"),
-            await proxy.perceive("irrigation"),
-            await proxy.perceive("camera"),
+        tools = [
+            WeatherPerceptionTool(proxy, self._events),
+            PrecipitationPerceptionTool(proxy, self._events),
+            IrrigationPerceptionTool(proxy, self._events),
+            CameraPerceptionTool(proxy, self._events),
+            IrrigationActionTool(proxy),
+            NotificationActionTool(proxy),
         ]
-        self._events.extend(events)
-        weather, precipitation, irrigation, camera = events
-        if self._backend is None:
+
+        if self.backend is None:
+            # No model configured, so run the same perception sequence and fall back.
+            events = [
+                await proxy.perceive("weather"),
+                await proxy.perceive("precipitation"),
+                await proxy.perceive("irrigation"),
+                await proxy.perceive("camera"),
+            ]
+            self._events.extend(events)
+            weather, precipitation, irrigation, camera = events
             decision = self._fallback.decision_from_events(
                 now,
                 weather=weather,
@@ -417,17 +514,13 @@ class NeuralMvpPlanner(BasePlanner):
                 action_count=action_count,
             )
 
-        prompt = self._decision_prompt(now, events)
+        prompt = self._decision_prompt(now)
         try:
-            response = self._backend.send(
-                [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ]
+            # In the live LLM path, tool calls are the only place perception and action happen.
+            text_chunks = await self.chat(
+                [prompt],
+                tools=tools,
             )
-            text_chunks, _ = self._backend.unpack_response(response)
             content = "\n".join(text_chunks).strip()
             parsed = json.loads(content)
             decision = Decision(
@@ -438,25 +531,23 @@ class NeuralMvpPlanner(BasePlanner):
                 rationale=parsed.get("rationale", "No rationale provided."),
                 metadata={"raw_response": content},
             )
-            action_count = 0
-            if decision.action == "water_on":
-                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
-                action_count += 1
-            elif decision.action == "water_off":
-                await proxy.act("irrigation", "water_off")
-                action_count += 1
-            elif decision.action == "notify":
-                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
-                action_count += 1
             return PlannerRunResult(
                 timestamp=now,
                 planner=self.name,
                 decision=decision,
                 trace=self._consume_trace(),
-                perception_count=len(events),
-                action_count=action_count,
+                perception_count=getattr(proxy, "perception_count", 0),
+                action_count=getattr(proxy, "action_count", 0),
             )
         except Exception as err:
+            events = [
+                await proxy.perceive("weather"),
+                await proxy.perceive("precipitation"),
+                await proxy.perceive("irrigation"),
+                await proxy.perceive("camera"),
+            ]
+            self._events.extend(events)
+            weather, precipitation, irrigation, camera = events
             decision = self._fallback.decision_from_events(
                 now,
                 weather=weather,
@@ -485,7 +576,7 @@ class NeuralMvpPlanner(BasePlanner):
                 action_count=action_count,
             )
 
-    def _decision_prompt(self, now: dt.datetime, events: List[Event]) -> str:
+    def _decision_prompt(self, now: dt.datetime) -> str:
         recent_events = [
             {
                 "timestamp": event.timestamp.isoformat(),
@@ -493,10 +584,11 @@ class NeuralMvpPlanner(BasePlanner):
                 "type": event.type,
                 "payload": event.payload,
             }
-            for event in (self._events[-8:] + events)[-12:]
+            for event in self._events[-12:]
         ]
         return (
             "You are a lawn irrigation planner. "
+            "You may call perception tools and actor tools before you answer. "
             "Return only valid JSON with keys action, duration_seconds, rationale. "
             "Allowed actions: water_on, water_off, no_op, notify.\n\n"
             f"Decision time: {now.isoformat()}\n"
