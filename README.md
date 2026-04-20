@@ -4,7 +4,7 @@
 
 This project compares classical/rule-based and neural-net-backed planners in a real-world application: lawn irrigation under uncertainty.
 
-We introduce a **structured intermediate representation** that decouples perception from decision-making and planning from downstream actions. This enables controlled, reproducible evaluation while still grounding the problem in real signals (weather forecasts, camera observations, irrigination historicals).
+We introduce a **structured intermediate representation** that mediates between perception, decision-making and downstream actions. This enables controlled, reproducible evaluation while still grounding the problem in real signals (weather forecasts, camera observations, irrigination historicals).
 
 ## Prologue  
 
@@ -31,16 +31,15 @@ Connectivity with the world enables the agent to gauge context and plan before i
 
 #### Perception 
 
-Perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and historical watering events. We bypass neural perception for precipitation and forecasts, but employ a classic and neural vision module to help assess respective benefits and drawbacks. 
+Perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and irrigation controller state. We bypass neural perception for precipitation and forecasts. The camera path is presently a lightweight scene abstraction built from frame statistics and sampled captures rather than a full semantic vision stack, but the interface is intentionally shaped so richer classical or neural vision modules can slot in later without perturbing the planner contract. 
 
-TODO: paste more schema defs to help user appreciate underlying mechanism
+Each backing service is condensed to a timestamped event:
 
 #### Planning 
 
-We implement a classic and LLM-based planner for comparison
+We implement a classic and LLM-based planner for comparison. Both planners operate on the same normalized event types and both are invoked through the same executor path.
 
-
-All inputs are represented as **timestamped events**:
+All planner-facing perceptions are represented as **timestamped events**:
 
 ```python
 @dataclass
@@ -53,11 +52,30 @@ class Event:
 
 #### Action 
 
-Actions are limited to actuating watering of the lawn and notifying humans off errors/or conflicts (service call)
+Actions are limited to actuating watering of the lawn and notifying humans off errors/or conflicts (service call). The irrigation path is implemented; notification is scaffolded but currently remains a dry-run actor.
 
 For MVP, the planner/action interface is intentionally synchronous: planners emit one decision per tick and receive an immediate coarse action result, avoiding async in-flight action state that would otherwise bloat the classical planner's state space without a clear policy benefit yet.
 
-TODO: paste more schema defs to help user appreciate underlying mechanism
+Action requests and their coarse results are also normalized:
+
+```python
+@dataclass
+class ActionRequest:
+    timestamp: datetime
+    planner: str
+    actor: str
+    action: str
+    kwargs: dict
+
+
+@dataclass
+class ActionResult:
+    timestamp: datetime
+    actor: str
+    action: str
+    status: Literal["dry_run", "executed", "failed"]
+    detail: dict
+```
 
 ### Evaluation Support
 
@@ -67,100 +85,79 @@ The system depends on real-world cues and developments that occur over long-ish 
 
 ### Bimodal Operation
 
-We model the system as a **time-indexed, event-driven pipeline** with a strict separation between:
+We model the system as a **tick-indexed planning loop** with a strict separation between:
 
-- **Event generation** (independent, asynchronous sources)
-- **State aggregation** (deterministic, ordered reconstruction)
-- **Decision points** (externally clocked via ticks)
+- **service probing / perception**, which gathers raw or normalized information from backing services
+- **planning**, which determines what additional information is needed and what single decision to emit for the current tick
+- **action execution**, which routes normalized action requests to concrete actors
 
 This design supports both:
-- **offline evaluation** (perfect ordering, reproducibility)
-- **online operation** (bounded-latency, real-time behavior)
+- **offline evaluation** (replay of previously logged planner episodes)
+- **online operation** (live service calls and optional real actuation)
 
-- All inputs are modeled as **timestamped event streams**
-- Events are **independent**, but reconciled at ingestion time
-- A **state aggregator** converts events into a discrete planner input
-- **Ticks act as decision boundaries**, enforcing consistent evaluation timing
-- Offline mode uses **perfect ordering** for reproducibility
-- Online mode uses **bounded ordering** for realism
-- The planner is **time-agnostic**, operating only on state
+- Ticks act as decision boundaries
+- The planner is invoked once per tick with an executor proxy and a concrete decision time
+- In live mode, the planner solicits perception through the proxy instead of being force-fed a complete event bundle
+- In replay mode, the same planner code runs against logged perception/action request-result pairs
+- Reproducibility comes from preserving planner I/O, not from reconstructing a separate state aggregator
 
-TODO: figure out how to unify the eval and real-time modes, can we just use the generator paradigm?
-
-Each backing service exposes an independent generator:
-```
-def weather_stream(...) -> Iterator[Event]
-def precipitation_stream(...) -> Iterator[Event]
-def camera_stream(...) -> Iterator[Event]
-def irrigation_stream(...) -> Iterator[Event]
-def tick_stream(start, end, interval) -> Iterator[Event]
-```
+This is less elegant on paper than a universal event bus, but it matches the actual control surface we need for MVP and it aligns with the long-term neural planner shape, where the model should decide what to inspect rather than be handed every observable on every wake-up.
 
 #### Offline (Evaluation mode) 
 
-TODO: design and implement using below snippets as cue: 
+Offline mode replays a previously recorded JSONL trajectory. Each tick forms one planner episode, and the replay proxy satisfies perception and action calls in the exact order they were originally observed.
 
 ```
-events = sorted(all_events, key=lambda e: e.timestamp)
-
-for event in events:
-    state = aggregator.update(event)
-
-    if event.type == "tick":
-        decision = planner(state)
-        log(event.timestamp, state, decision)
+for episode in recorded_episodes:
+    proxy = ReplayExecutorProxy(episode.records)
+    result = await planner.run(proxy, now=episode.tick_time)
+    compare(result, episode)
 ```
 
 Properties:
 
-- perfect ordering
+- strict planner I/O ordering
 - deterministic
-- used for evaluation and dataset generation
+- used for evaluation and regression testing
 
 Dataset generation: 
 
 ```
-for t in sampled_timestamps:
-    state = build_state_from_events_up_to(t)
-    label = human_label(t)
-    dataset.append((t, state, label))
+for trajectory in recorded_runs:
+    for episode in trajectory:
+        dataset.append((episode.inputs, episode.decision, episode.action_results))
 ``` 
 
 #### Online (Live mode) 
 
-TODO: design and implement using below snippet as a cue: 
+Online mode drives the same planner through a live executor proxy. The proxy records each perception request, perception result, action request and action result so the run can be replayed later.
 
 ```
-buffer = []
-max_seen = None
-
-def ingest(event):
-    global max_seen
-    max_seen = max(max_seen, event.timestamp) if max_seen else event.timestamp
-    heapq.heappush(buffer, (event.timestamp, event))
-
-def flush_up_to(ts):
-    while buffer and buffer[0][0] <= ts:
-        _, event = heapq.heappop(buffer)
-        aggregator.update(event)
-
-def main_loop():
-    for event in incoming_events():
-        ingest(event)
-
-        if event.type == "tick":
-            flush_up_to(event.timestamp)
-            decision = planner(state)
-            emit(decision)
+for tick_index in range(tick_count):
+    proxy = LiveExecutorProxy(...)
+    result = await planner.run(proxy, now=current_time())
+    append_jsonl("planner_run", result)
+    sleep(tick_seconds)
 ```
 
 ## System Operation 
 
-TODO: insert description of how to interact with the sysetm in eval/playback or real-time modes
+The system is currently exercised through a unified CLI:
+
+- `probe service ...` inspects backing-service raw outputs
+- `probe perception ...` emits normalized planner-facing events
+- `run --planner classical|neural ...` executes live ticks and can optionally actuate
+- `replay --planner classical|neural --log-jsonl ...` reruns the planner against a recorded trajectory
 
 ## Evaluation 
 
-TODO: insert desciprtion of how to evaluate playback mode outputs to emit a performance assessment
+Evaluation presently hinges on playback consistency and inspection of planner residue:
+
+- whether the planner reaches a coherent decision for each replayed tick
+- whether perception/action call ordering remains stable across code changes
+- whether the emitted decision and resulting action trace remain acceptable under known scenarios
+
+This is not yet a full scoring harness, but the replay path gives us a clean mechanism for regression tests and for assembling adversarial or counterfactual episodes without touching live infrastructure.
 
 ## Backing Services
 
