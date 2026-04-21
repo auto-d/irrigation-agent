@@ -15,6 +15,7 @@ from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
 class WorldState:
     """Condensed planner inputs for one behavior-tree tick."""
 
+    wall_time_allows_watering: bool
     irrigation: Dict[str, Any]
     precipitation: Dict[str, Any]
     forecast: Dict[str, Any]
@@ -82,6 +83,31 @@ class ClassicalPlanner(BasePlanner):
     async def run(self, proxy: PlannerProxy, *, now: datetime) -> PlannerRunResult:
         irrigation = await proxy.perceive("irrigation")
         perception_count = 1
+
+        if not self._is_within_watering_window(now):
+            irrigation_running = bool(irrigation.payload.get("api_reports_on"))
+            decision = self._decision(
+                now,
+                action="water_off" if irrigation_running else "no_op",
+                rationale=(
+                    "Local wall time is outside the allowed daylight watering window, so watering should stop."
+                    if irrigation_running
+                    else "Local wall time is outside the allowed daylight watering window, so watering should not begin."
+                ),
+                metadata={"source": "time", "policy_step": -1, **self._watering_window_summary(now)},
+            )
+            action_count = 0
+            if decision.action == "water_off":
+                await proxy.act("irrigation", "water_off")
+                action_count += 1
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=perception_count,
+                action_count=action_count,
+            )
 
         if self._irrigation_abort(irrigation.payload):
             decision = self._decision(
@@ -192,6 +218,7 @@ class ClassicalPlanner(BasePlanner):
     ) -> Decision:
         """Compute one decision from already-materialized perception events."""
         self._blackboard.world_state = WorldState(
+            wall_time_allows_watering=self._is_within_watering_window(now),
             irrigation=irrigation.payload,
             precipitation=precipitation.payload,
             forecast=weather.payload,
@@ -233,6 +260,26 @@ class ClassicalPlanner(BasePlanner):
         root = py_trees.composites.Selector(name="IrrigationDecision", memory=False)
         root.add_children(
             [
+                self.WorldStateCondition(
+                    name="OutsideDaylightAndRunning",
+                    blackboard=self._blackboard,
+                    predicate=self._outside_watering_window_and_running,
+                    outcome=TreeOutcome(
+                        action="water_off",
+                        rationale="Local wall time is outside the allowed daylight watering window, so watering should stop.",
+                        metadata={"source": "time", "tree_node": "outside_daylight_and_running", "policy_step": -1},
+                    ),
+                ),
+                self.WorldStateCondition(
+                    name="OutsideDaylight",
+                    blackboard=self._blackboard,
+                    predicate=self._outside_watering_window,
+                    outcome=TreeOutcome(
+                        action="no_op",
+                        rationale="Local wall time is outside the allowed daylight watering window, so watering should not begin.",
+                        metadata={"source": "time", "tree_node": "outside_daylight", "policy_step": -1},
+                    ),
+                ),
                 self.WorldStateCondition(
                     name="IrrigationRecentOrRunning",
                     blackboard=self._blackboard,
@@ -294,6 +341,14 @@ class ClassicalPlanner(BasePlanner):
             or irrigation.get("expected_on")
             or irrigation.get("watered_within_24h")
         )
+
+    @staticmethod
+    def _outside_watering_window(world_state: WorldState) -> bool:
+        return not world_state.wall_time_allows_watering
+
+    @staticmethod
+    def _outside_watering_window_and_running(world_state: WorldState) -> bool:
+        return (not world_state.wall_time_allows_watering) and bool(world_state.irrigation.get("api_reports_on"))
 
     @staticmethod
     def _recent_rain(world_state: WorldState) -> bool:
