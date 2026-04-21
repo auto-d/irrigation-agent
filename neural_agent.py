@@ -245,8 +245,8 @@ class LlmAgent():
 class WeatherPerceptionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "perceive_weather",
-        "description": "Fetch a normalized weather forecast perception event.",
+        "name": "inspect_weather_forecast",
+        "description": "Inspect the weather forecast for the next few hours or days. Use this to decide whether rain is expected soon enough that watering would be wasteful.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -283,8 +283,8 @@ class WeatherPerceptionTool(Tool):
 class PrecipitationPerceptionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "perceive_precipitation",
-        "description": "Fetch a normalized precipitation-history perception event.",
+        "name": "inspect_recent_rainfall",
+        "description": "Inspect recent rainfall totals. Use this to decide whether the ground is likely already wet enough that watering should be skipped.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -310,8 +310,8 @@ class PrecipitationPerceptionTool(Tool):
 class IrrigationPerceptionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "perceive_irrigation",
-        "description": "Fetch a normalized irrigation-status perception event.",
+        "name": "inspect_irrigation_state",
+        "description": "Inspect whether the irrigation device is connected, currently watering, expected to be watering, or was watered recently.",
         "parameters": {
             "type": "object",
             "properties": {},
@@ -335,8 +335,8 @@ class IrrigationPerceptionTool(Tool):
 class CameraPerceptionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "perceive_camera",
-        "description": "Fetch a normalized camera scene-activity perception event.",
+        "name": "inspect_lawn_camera",
+        "description": "Inspect the lawn camera. Use this when you need to know whether a person, animal, mower, or other obstacle may be present on the lawn.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -363,16 +363,19 @@ class CameraPerceptionTool(Tool):
 class IrrigationActionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "act_irrigation",
-        "description": "Actuate the irrigation actor.",
+        "name": "set_watering",
+        "description": "Control lawn watering. Start watering, stop watering, or run a short cycle for testing. Use this only when you have enough evidence to justify changing the valve state.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["water_on", "water_off", "cycle"],
+                    "enum": ["start_watering", "stop_watering", "cycle_watering"],
                 },
-                "duration_seconds": {"type": "integer"},
+                "duration_seconds": {
+                    "type": "integer",
+                    "description": "How long to water for when starting or cycling watering.",
+                },
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -387,15 +390,19 @@ class IrrigationActionTool(Tool):
     async def run(self, instance, callback=None):
         arguments = self.validate_instance(instance)
         action = arguments.pop("action")
-        result = await self.proxy.act("irrigation", action, **arguments)
+        mapped_action = {
+            "start_watering": "water_on",
+            "stop_watering": "water_off",
+            "cycle_watering": "cycle",
+        }[action]
+        result = await self.proxy.act("irrigation", mapped_action, **arguments)
         return self.build_result(
             instance.call_id,
             "ok",
             {
-                "action_result": {
+                "watering_result": {
                     "timestamp": result.timestamp.isoformat(),
-                    "actor": result.actor,
-                    "action": result.action,
+                    "action": action,
                     "status": result.status,
                     "detail": result.detail,
                 }
@@ -406,15 +413,18 @@ class IrrigationActionTool(Tool):
 class NotificationActionTool(Tool):
     TOOL_DESC = {
         "type": "function",
-        "name": "act_notification",
-        "description": "Invoke the notification actor.",
+        "name": "send_human_message",
+        "description": "Send a message to a human via Discord. Use this to flag error conditions, warnings, or ambiguous situations that should be surfaced rather than handled silently.",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["send"]},
                 "message": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional compact machine-readable context to include with the message.",
+                },
             },
-            "required": ["action", "message"],
+            "required": ["message"],
             "additionalProperties": False,
         },
     }
@@ -426,16 +436,14 @@ class NotificationActionTool(Tool):
 
     async def run(self, instance, callback=None):
         arguments = self.validate_instance(instance)
-        action = arguments.pop("action")
-        result = await self.proxy.act("notification", action, **arguments)
+        result = await self.proxy.act("notification", "send", **arguments)
         return self.build_result(
             instance.call_id,
             "ok",
             {
-                "action_result": {
+                "message_result": {
                     "timestamp": result.timestamp.isoformat(),
-                    "actor": result.actor,
-                    "action": result.action,
+                    "delivery_channel": "discord",
                     "status": result.status,
                     "detail": result.detail,
                 }
@@ -457,9 +465,18 @@ class NeuralPlanner(LlmAgent, BasePlanner):
             backend=backend,
             dev_msgs=[
                 (
-                    "You are an irrigation planning agent. Use the provided tools to gather only the "
-                    "information you need, then optionally invoke an action tool, and finally respond "
-                    "with compact JSON containing keys action, duration_seconds, rationale."
+                    "You are an irrigation planning agent responsible for a residential lawn. "
+                    "Your job is to decide whether to water now, stop watering, do nothing, or message a human "
+                    "when the situation is ambiguous or concerning. "
+                    "Use the available tools to inspect only the information you need. "
+                    "Do not refer to internal framework concepts such as actors, proxies, or planner internals. "
+                    "Think in domain terms: recent watering, recent rain, forecast rain, obstacles on the lawn, "
+                    "daylight versus nighttime, "
+                    "and whether a human should be notified. "
+                    "Never begin watering outside the allowed daylight watering window. "
+                    "If you use a messaging tool, reserve it for warnings, failures, or ambiguity worth surfacing to a human. "
+                    "After you are done gathering information and taking any necessary tool actions, respond with compact JSON "
+                    "containing keys action, duration_seconds, rationale."
                 )
             ],
         )
@@ -516,10 +533,15 @@ class NeuralPlanner(LlmAgent, BasePlanner):
             for event in self._events[-12:]
         ]
         return (
-            "You are a lawn irrigation planner. "
-            "You may call perception tools and actor tools before you answer. "
+            "You are deciding what to do about watering a residential lawn right now. "
+            "You may inspect the forecast, recent rainfall, irrigation state, and lawn camera before answering. "
+            "You may also start or stop watering, run a short watering cycle, or send a human a Discord message if the situation warrants it. "
+            "Watering is only allowed during the local daylight watering window. "
             "Return only valid JSON with keys action, duration_seconds, rationale. "
-            "Allowed actions: water_on, water_off, no_op, notify.\n\n"
+            "Allowed final action values: water_on, water_off, no_op, notify. "
+            "Use water_on when the decision is to water the lawn, water_off when the decision is to stop watering, "
+            "no_op when the right move is to leave things alone, and notify when the main outcome is to surface the situation to a human.\n\n"
             f"Decision time: {now.isoformat()}\n"
+            f"Wall-time guard: {json.dumps(self._watering_window_summary(now), sort_keys=True)}\n"
             f"Recent events: {json.dumps(recent_events, sort_keys=True)}"
         )
