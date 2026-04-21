@@ -221,6 +221,7 @@ class PerceptionConfig:
     camera_url: str | None = None
     sample_frames: int = 3
     save_frame: str | None = None
+    notification_message: str | None = None
 
 
 class ServicePerceptionProxy:
@@ -236,6 +237,7 @@ class ServicePerceptionProxy:
             IrrigationPerceptor,
             SecurityCameraPerceptor,
         )
+        from services.notification import DiscordWebhookClient
 
         results: Dict[str, Any] = {}
         location = await self._resolve_lat_lon()
@@ -267,6 +269,15 @@ class ServicePerceptionProxy:
                     sample_frames=self._config.sample_frames,
                     save_frame_path=self._config.save_frame,
                 )
+
+        if target in {"notification", "all"}:
+            try:
+                async with DiscordWebhookClient.from_env() as client:
+                    results["notification"] = await client.probe(
+                        message=self._config.notification_message or "Notification probe from irrigation-agent."
+                    )
+            except Exception as err:
+                results["notification"] = {"error": f"{type(err).__name__}: {err}"}
 
         return results
 
@@ -388,18 +399,31 @@ class IrrigationActor:
 
 
 class NotificationActor:
-    """Placeholder actor for planner notifications."""
+    """Actor that delivers planner notifications through Discord."""
 
     name = "notification"
 
     async def execute(self, action: str, **kwargs: Any) -> ActionResult:
         now = dt.datetime.now(dt.timezone.utc)
+        if action != "send":
+            raise ValueError(f"Unsupported notification action: {action}")
+
+        from services.notification import DiscordWebhookClient
+
+        message = str(kwargs.get("message") or "").strip()
+        if not message:
+            raise ValueError("NotificationActor.send requires a non-empty message")
+
+        metadata = kwargs.get("metadata")
+        async with DiscordWebhookClient.from_env() as client:
+            result = await client.send(message, metadata=metadata if isinstance(metadata, dict) else None)
+
         return ActionResult(
             timestamp=now,
             actor=self.name,
             action=action,
-            status="dry_run",
-            detail={"reason": "notification actor not implemented yet", "request": kwargs},
+            status="executed",
+            detail={"result": result},
         )
 
 

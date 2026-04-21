@@ -31,9 +31,31 @@ Connectivity with the world enables the agent to gauge context and plan before i
 
 #### Perception 
 
-Perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and irrigation controller state. We bypass neural perception for precipitation and forecasts. The camera path is presently a lightweight scene abstraction built from frame statistics and sampled captures rather than a full semantic vision stack, but the interface is intentionally shaped so richer classical or neural vision modules can slot in later without perturbing the planner contract. 
+The perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and irrigation controller state. We bypass neural perception for precipitation and forecasts. The camera path is presently a lightweight scene abstraction built from frame statistics and sampled captures rather than a full semantic vision stack, but the interface is intentionally shaped so richer classical or neural vision modules can slot in later without perturbing the planner contract. 
 
-Each backing service is condensed to a timestamped event:
+**Classical Planner:** We employ behavior trees due to the relatively limited number of states we have to transition through, the potential for significant increase in states with async events and actions (suggests composability would be useful), and their intuitive nature. Here's a simplified tree that satisifies our agent's task: 
+
+```
+  Decision
+  |
+  +-- Watering
+  |   condition: irrigation.sprinkler_active OR irrigation.sprinkler_scheduled
+  |   action: no_op
+  |
+  +-- Wet 
+  |   condition: precipitation.recent_rain OR max_precip_probability >= 50
+  |   action: no_op
+  |
+  +-- SceneUnsafe
+  |   condition:camera.person_detected OR camera.animal_detected OR camera.lawn_mower_active
+  |   action: water_off
+  |
+  +-- DefaultWaterOn
+      action = water_on
+      duration_minutes = 60
+```      
+
+**Neural Planner**: Because they are everywhere, and you can't swing a bat without hitting one, we compare against an LLM-driven agent. The agent leverages a backend API for completions, manages it's own internal memory, and carries out observations and actions through tool calls.
 
 #### Planning 
 
@@ -52,7 +74,7 @@ class Event:
 
 #### Action 
 
-Actions are limited to actuating watering of the lawn and notifying humans off errors/or conflicts (service call). The irrigation path is implemented; notification is scaffolded but currently remains a dry-run actor.
+Actions are limited to actuating watering of the lawn and notifying humans off errors/or conflicts (service call). The irrigation path is implemented, and the notification path currently targets a Discord webhook.
 
 For MVP, the planner/action interface is intentionally synchronous: planners emit one decision per tick and receive an immediate coarse action result, avoiding async in-flight action state that would otherwise bloat the classical planner's state space without a clear policy benefit yet.
 
@@ -522,6 +544,17 @@ Current shape:
 - `ffmpeg` handles the RTSP/RTSPS session and decode
 - Python receives fixed-size `numpy` frames in `BGR`
 - the main loop is the place to attach perception or agent-facing logic
+
+### 🔔 Notifications
+
+Outbound planner notifications are implemented via a Discord webhook.
+
+Configuration:
+
+- `DISCORD_WEBHOOK_URL`: required webhook target
+- `DISCORD_WEBHOOK_USERNAME`: optional display name override
+
+The notification actor uses this service when the planner emits `notification.send`, and `probe service notification --message "..."` can be used to verify delivery through the CLI.
 
 ## Requirements
 

@@ -49,6 +49,7 @@ def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
         camera_url=getattr(args, "camera_url", None),
         sample_frames=getattr(args, "sample_frames", 3),
         save_frame=getattr(args, "save_frame", None),
+        notification_message=getattr(args, "message", None),
     )
 
 
@@ -70,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     probe_sub = probe.add_subparsers(dest="probe_target", required=True)
 
     service = probe_sub.add_parser("service")
-    service.add_argument("target", choices=["all", "weather", "precipitation", "irrigation", "camera"])
+    service.add_argument("target", choices=["all", "weather", "precipitation", "irrigation", "camera", "notification"])
     service.add_argument("--lat", type=float)
     service.add_argument("--lon", type=float)
     service.add_argument("--infer-location", action="store_true")
@@ -80,6 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     service.add_argument("--camera-url")
     service.add_argument("--sample-frames", type=int, default=1)
     service.add_argument("--save-frame")
+    service.add_argument("--message")
 
     perception = probe_sub.add_parser("perception")
     perception.add_argument("target", choices=["all", "weather", "precipitation", "irrigation", "camera"])

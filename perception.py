@@ -255,9 +255,15 @@ class IrrigationPerceptor:
         async with controller_from_env() as controller:
             sprinkler = controller.list_sprinkler_devices()[0]
             programs = controller.get_programs(str(sprinkler["id"]))
-        return self._irrigation_event(sprinkler, programs)
+            history = await controller.get_history(str(sprinkler["id"]))
+        return self._irrigation_event(sprinkler, programs, history)
 
-    def _irrigation_event(self, sprinkler: Dict[str, Any], programs: List[Dict[str, Any]]) -> Event:
+    def _irrigation_event(
+        self,
+        sprinkler: Dict[str, Any],
+        programs: List[Dict[str, Any]],
+        history: Any,
+    ) -> Event:
         now_local = dt.datetime.now().astimezone()
         # The API status is not reliable on its own for the hose timer, so we
         # also derive whether the device should be running from local schedules.
@@ -270,6 +276,7 @@ class IrrigationPerceptor:
             "run_mode": status.get("run_mode"),
             "api_reports_on": self._api_reports_on(status),
             "expected_on": expected_on,
+            "watered_within_24h": self._watered_within_window(history, hours=24),
             "matching_programs": matching_programs,
             "next_start_time": status.get("next_start_time"),
             "next_start_programs": status.get("next_start_programs"),
@@ -309,6 +316,78 @@ class IrrigationPerceptor:
                 if started <= now_local <= ended:
                     matching.append(program.get("program") or program.get("name") or program.get("id"))
         return (len(matching) > 0, matching)
+
+    @classmethod
+    def _watered_within_window(cls, history: Any, *, hours: int) -> bool:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+        for started_at, duration_minutes in cls._history_runs(history):
+            if started_at is None:
+                continue
+            ended_at = started_at + dt.timedelta(minutes=max(duration_minutes, 0.0))
+            if ended_at >= cutoff:
+                return True
+        return False
+
+    @classmethod
+    def _history_runs(cls, history: Any) -> List[tuple[dt.datetime | None, float]]:
+        runs: List[tuple[dt.datetime | None, float]] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+                return
+            if isinstance(value, dict):
+                started_at = cls._parse_history_datetime(
+                    value.get("started_at")
+                    or value.get("start_time")
+                    or value.get("watering_started_at")
+                    or value.get("created_at")
+                )
+                duration_minutes = cls._extract_duration_minutes(value)
+                if started_at is not None and duration_minutes is not None:
+                    runs.append((started_at, duration_minutes))
+                for nested in value.values():
+                    if isinstance(nested, (list, dict)):
+                        visit(nested)
+
+        visit(history)
+        return runs
+
+    @staticmethod
+    def _parse_history_datetime(value: Any) -> dt.datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        normalized = value.replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+
+    @staticmethod
+    def _extract_duration_minutes(payload: Dict[str, Any]) -> float | None:
+        candidates = (
+            ("duration", 1.0),
+            ("duration_minutes", 1.0),
+            ("run_time", 1.0),
+            ("runtime", 1.0),
+            ("watering_duration", 1.0),
+            ("duration_seconds", 1.0 / 60.0),
+            ("run_time_seconds", 1.0 / 60.0),
+            ("runtime_seconds", 1.0 / 60.0),
+        )
+        for key, scale in candidates:
+            value = payload.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value) * scale
+            except (TypeError, ValueError):
+                continue
+        return 0.0
 
 
 class SecurityCameraPerceptor:

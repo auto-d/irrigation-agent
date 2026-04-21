@@ -80,23 +80,90 @@ class ClassicalPlanner(BasePlanner):
         self._tree.setup()
 
     async def run(self, proxy: PlannerProxy, *, now: datetime) -> PlannerRunResult:
-        # The classical planner is intentionally explicit here: fetch a small,
-        # fixed set of perceptions, run the tree once, then emit at most one action.
-        weather = await proxy.perceive("weather")
-        precipitation = await proxy.perceive("precipitation")
         irrigation = await proxy.perceive("irrigation")
+        perception_count = 1
+
+        if self._irrigation_abort(irrigation.payload):
+            decision = self._decision(
+                now,
+                action="no_op",
+                rationale="Irrigation is active now or the lawn has been watered within the last 24 hours.",
+                metadata={"source": "irrigation", "policy_step": 0},
+            )
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=perception_count,
+                action_count=0,
+            )
+
+        precipitation = await proxy.perceive("precipitation")
+        perception_count += 1
+        if self._recent_rain_payload(precipitation.payload):
+            decision = self._decision(
+                now,
+                action="no_op",
+                rationale="Recent precipitation indicates the ground is already wet.",
+                metadata={"source": "precipitation", "policy_step": 1},
+            )
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=perception_count,
+                action_count=0,
+            )
+
+        weather = await proxy.perceive("weather", forecast_hours=24)
+        perception_count += 1
+        if self._forecast_says_rain_payload(weather.payload):
+            decision = self._decision(
+                now,
+                action="no_op",
+                rationale="Rain is forecast within the next day.",
+                metadata={"source": "weather", "policy_step": 2, "forecast_window_hours": 24},
+            )
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=perception_count,
+                action_count=0,
+            )
+
         camera = await proxy.perceive("camera")
-        decision = self.decision_from_events(
+        perception_count += 1
+        if self._scene_unsafe_payload(camera.payload):
+            decision = self._decision(
+                now,
+                action="no_op",
+                rationale="A human or obstacle appears to be on the lawn.",
+                metadata={"source": "camera", "policy_step": 3},
+            )
+            return PlannerRunResult(
+                timestamp=now,
+                planner=self.name,
+                decision=decision,
+                trace=self._consume_trace(),
+                perception_count=perception_count,
+                action_count=0,
+            )
+
+        decision = self._decision(
             now,
-            weather=weather,
-            precipitation=precipitation,
-            irrigation=irrigation,
-            camera=camera,
+            action="water_on",
+            duration_seconds=3600,
+            rationale="No recent watering, rain, or obstacle detected; water for 60 minutes.",
+            metadata={"source": "rule_tree", "policy_step": 4},
         )
 
         action_count = 0
         if decision.action == "water_on":
-            await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
+            await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 3600)
             action_count += 1
         elif decision.action == "water_off":
             await proxy.act("irrigation", "water_off")
@@ -110,7 +177,7 @@ class ClassicalPlanner(BasePlanner):
             planner=self.name,
             decision=decision,
             trace=self._consume_trace(),
-            perception_count=4,
+            perception_count=perception_count,
             action_count=action_count,
         )
 
@@ -135,13 +202,30 @@ class ClassicalPlanner(BasePlanner):
         outcome = self._blackboard.outcome
         if outcome is None:
             raise RuntimeError("Behavior tree tick completed without producing an outcome.")
-        return Decision(
-            timestamp=now,
-            planner=self.name,
+        return self._decision(
+            now,
             action=outcome.action,
             duration_seconds=outcome.duration_seconds,
             rationale=outcome.rationale,
             metadata=outcome.metadata,
+        )
+
+    def _decision(
+        self,
+        now: datetime,
+        *,
+        action: str,
+        rationale: str,
+        metadata: Dict[str, Any],
+        duration_seconds: Optional[int] = None,
+    ) -> Decision:
+        return Decision(
+            timestamp=now,
+            planner=self.name,
+            action=action,
+            duration_seconds=duration_seconds,
+            rationale=rationale,
+            metadata=metadata,
         )
 
     def _build_tree(self) -> py_trees.behaviour.Behaviour:
@@ -150,13 +234,13 @@ class ClassicalPlanner(BasePlanner):
         root.add_children(
             [
                 self.WorldStateCondition(
-                    name="IrrigationRunning",
+                    name="IrrigationRecentOrRunning",
                     blackboard=self._blackboard,
-                    predicate=self._irrigation_running,
+                    predicate=self._irrigation_abort,
                     outcome=TreeOutcome(
                         action="no_op",
-                        rationale="Irrigation appears to be running or expected to be running already.",
-                        metadata={"source": "irrigation", "tree_node": "irrigation_running"},
+                        rationale="Irrigation is active now or the lawn has been watered within the last 24 hours.",
+                        metadata={"source": "irrigation", "tree_node": "irrigation_recent_or_running", "policy_step": 0},
                     ),
                 ),
                 self.WorldStateCondition(
@@ -165,8 +249,8 @@ class ClassicalPlanner(BasePlanner):
                     predicate=self._recent_rain,
                     outcome=TreeOutcome(
                         action="no_op",
-                        rationale="Recent precipitation exceeds the watering threshold.",
-                        metadata={"source": "precipitation", "tree_node": "recent_rain"},
+                        rationale="Recent precipitation indicates the ground is already wet.",
+                        metadata={"source": "precipitation", "tree_node": "recent_rain", "policy_step": 1},
                     ),
                 ),
                 self.WorldStateCondition(
@@ -175,8 +259,8 @@ class ClassicalPlanner(BasePlanner):
                     predicate=self._forecast_says_rain,
                     outcome=TreeOutcome(
                         action="no_op",
-                        rationale="Forecast indicates rain is likely within the configured window.",
-                        metadata={"source": "weather", "tree_node": "forecast_rain"},
+                        rationale="Rain is forecast within the next day.",
+                        metadata={"source": "weather", "tree_node": "forecast_rain", "policy_step": 2},
                     ),
                 ),
                 self.WorldStateCondition(
@@ -184,18 +268,18 @@ class ClassicalPlanner(BasePlanner):
                     blackboard=self._blackboard,
                     predicate=self._scene_unsafe,
                     outcome=TreeOutcome(
-                        action="water_off",
-                        rationale="Scene appears occupied or unsafe for watering.",
-                        metadata={"source": "camera", "tree_node": "scene_unsafe"},
+                        action="no_op",
+                        rationale="A human or obstacle appears to be on the lawn.",
+                        metadata={"source": "camera", "tree_node": "scene_unsafe", "policy_step": 3},
                     ),
                 ),
                 self.DefaultOutcome(
                     blackboard=self._blackboard,
                     outcome=TreeOutcome(
                         action="water_on",
-                        duration_seconds=300,
-                        rationale="No rain signal or occupancy conflict detected; emit a short watering action.",
-                        metadata={"source": "rule_tree", "tree_node": "default_water_on"},
+                        duration_seconds=3600,
+                        rationale="No recent watering, rain, or obstacle detected; water for 60 minutes.",
+                        metadata={"source": "rule_tree", "tree_node": "default_water_on", "policy_step": 4},
                     ),
                 ),
             ]
@@ -203,27 +287,43 @@ class ClassicalPlanner(BasePlanner):
         return root
 
     @staticmethod
-    def _irrigation_running(world_state: WorldState) -> bool:
-        return bool(world_state.irrigation.get("api_reports_on") or world_state.irrigation.get("expected_on"))
+    def _irrigation_abort(world_state: WorldState | Dict[str, Any]) -> bool:
+        irrigation = world_state.irrigation if isinstance(world_state, WorldState) else world_state
+        return bool(
+            irrigation.get("api_reports_on")
+            or irrigation.get("expected_on")
+            or irrigation.get("watered_within_24h")
+        )
 
     @staticmethod
     def _recent_rain(world_state: WorldState) -> bool:
+        return ClassicalPlanner._recent_rain_payload(world_state.precipitation)
+
+    @staticmethod
+    def _recent_rain_payload(precipitation: Dict[str, Any]) -> bool:
         return bool(
-            world_state.precipitation.get("recent_rain")
-            or world_state.precipitation.get("total_inches", 0.0) >= 0.1
+            precipitation.get("recent_rain")
+            or precipitation.get("total_inches", 0.0) >= 0.1
         )
 
     @staticmethod
     def _forecast_says_rain(world_state: WorldState) -> bool:
+        return ClassicalPlanner._forecast_says_rain_payload(world_state.forecast)
+
+    @staticmethod
+    def _forecast_says_rain_payload(forecast: Dict[str, Any]) -> bool:
         return bool(
-            world_state.forecast.get("rain_expected_in_window")
-            or world_state.forecast.get("rain_expected_soon")
-            or (world_state.forecast.get("max_precip_probability") or 0) >= 50
+            forecast.get("rain_expected_in_window")
+            or forecast.get("rain_expected_soon")
+            or (forecast.get("max_precip_probability") or 0) >= 50
         )
 
     @staticmethod
     def _scene_unsafe(world_state: WorldState) -> bool:
-        camera = world_state.camera
+        return ClassicalPlanner._scene_unsafe_payload(world_state.camera)
+
+    @staticmethod
+    def _scene_unsafe_payload(camera: Dict[str, Any]) -> bool:
         return bool(
             camera.get("person_detected")
             or camera.get("animal_detected")

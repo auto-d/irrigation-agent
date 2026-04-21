@@ -9,7 +9,6 @@ from copy import deepcopy
 import json 
 from typing import Any, Dict, List
 
-from classical_agent import ClassicalPlanner
 from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
 
 class Backend(): 
@@ -444,14 +443,13 @@ class NotificationActionTool(Tool):
         )
 
 class NeuralPlanner(LlmAgent, BasePlanner): 
-    """LLM-backed planner with a classical fallback."""
+    """LLM-backed planner."""
 
     name = "neural"
 
     def __init__(self, api_key: str | None = None) -> None:
         BasePlanner.__init__(self)
         self._events: List[Event] = []
-        self._fallback = ClassicalPlanner()
         self._api_key = api_key or os.getenv("OPENAI_API_KEY")
         backend = Backend(self._api_key, model="gpt-5.4-mini") if self._api_key else None
         LlmAgent.__init__(
@@ -477,42 +475,7 @@ class NeuralPlanner(LlmAgent, BasePlanner):
         ]
 
         if self.backend is None:
-            # No model configured, so run the same perception sequence and fall back.
-            events = [
-                await proxy.perceive("weather"),
-                await proxy.perceive("precipitation"),
-                await proxy.perceive("irrigation"),
-                await proxy.perceive("camera"),
-            ]
-            self._events.extend(events)
-            weather, precipitation, irrigation, camera = events
-            decision = self._fallback.decision_from_events(
-                now,
-                weather=weather,
-                precipitation=precipitation,
-                irrigation=irrigation,
-                camera=camera,
-            )
-            decision.planner = self.name
-            decision.metadata["fallback"] = "no_api_key"
-            action_count = 0
-            if decision.action == "water_on":
-                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
-                action_count += 1
-            elif decision.action == "water_off":
-                await proxy.act("irrigation", "water_off")
-                action_count += 1
-            elif decision.action == "notify":
-                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
-                action_count += 1
-            return PlannerRunResult(
-                timestamp=now,
-                planner=self.name,
-                decision=decision,
-                trace=self._consume_trace(),
-                perception_count=len(events),
-                action_count=action_count,
-            )
+            raise RuntimeError("Neural planner requested without an OpenAI backend. Set OPENAI_API_KEY.")
 
         prompt = self._decision_prompt(now)
         try:
@@ -540,41 +503,7 @@ class NeuralPlanner(LlmAgent, BasePlanner):
                 action_count=getattr(proxy, "action_count", 0),
             )
         except Exception as err:
-            events = [
-                await proxy.perceive("weather"),
-                await proxy.perceive("precipitation"),
-                await proxy.perceive("irrigation"),
-                await proxy.perceive("camera"),
-            ]
-            self._events.extend(events)
-            weather, precipitation, irrigation, camera = events
-            decision = self._fallback.decision_from_events(
-                now,
-                weather=weather,
-                precipitation=precipitation,
-                irrigation=irrigation,
-                camera=camera,
-            )
-            decision.planner = self.name
-            decision.metadata["fallback"] = f"backend_error:{type(err).__name__}"
-            action_count = 0
-            if decision.action == "water_on":
-                await proxy.act("irrigation", "water_on", duration_seconds=decision.duration_seconds or 300)
-                action_count += 1
-            elif decision.action == "water_off":
-                await proxy.act("irrigation", "water_off")
-                action_count += 1
-            elif decision.action == "notify":
-                await proxy.act("notification", "send", message=decision.rationale, metadata=decision.metadata)
-                action_count += 1
-            return PlannerRunResult(
-                timestamp=now,
-                planner=self.name,
-                decision=decision,
-                trace=self._consume_trace(),
-                perception_count=len(events),
-                action_count=action_count,
-            )
+            raise RuntimeError(f"Neural planner execution failed: {type(err).__name__}: {err}") from err
 
     def _decision_prompt(self, now: dt.datetime) -> str:
         recent_events = [
