@@ -7,12 +7,16 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import logging
+import os
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from classical_agent import ClassicalPlanner
 from neural_agent import NeuralPlanner
 from planner import PerceptionConfig, PlannerExecutor, ServicePerceptionProxy
+
+_LOG = logging.getLogger(__name__)
 
 
 def _jsonable(value: Any) -> Any:
@@ -49,6 +53,10 @@ def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
         camera_url=getattr(args, "camera_url", None),
         sample_frames=getattr(args, "sample_frames", 3),
         save_frame=getattr(args, "save_frame", None),
+        baseline_image_dir=getattr(args, "baseline_image_dir", None),
+        baseline_output=getattr(args, "baseline_output", None),
+        score_image=getattr(args, "score_image", None),
+        score_image_dir=getattr(args, "score_image_dir", None),
         notification_message=getattr(args, "message", None),
     )
 
@@ -81,6 +89,10 @@ def _build_parser() -> argparse.ArgumentParser:
     service.add_argument("--camera-url")
     service.add_argument("--sample-frames", type=int, default=1)
     service.add_argument("--save-frame")
+    service.add_argument("--baseline-image-dir")
+    service.add_argument("--baseline-output")
+    service.add_argument("--score-image")
+    service.add_argument("--score-image-dir")
     service.add_argument("--message")
 
     perception = probe_sub.add_parser("perception")
@@ -94,6 +106,10 @@ def _build_parser() -> argparse.ArgumentParser:
     perception.add_argument("--camera-url")
     perception.add_argument("--sample-frames", type=int, default=3)
     perception.add_argument("--save-frame")
+    perception.add_argument("--baseline-image-dir")
+    perception.add_argument("--baseline-output")
+    perception.add_argument("--score-image")
+    perception.add_argument("--score-image-dir")
 
     run = subparsers.add_parser("run")
     run.add_argument("--planner", choices=["classical", "neural"], required=True)
@@ -110,13 +126,24 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--duration-seconds", type=float, default=300.0)
     run.add_argument("--log-jsonl")
     run.add_argument("--execute-actions", action="store_true")
+    run.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
 
     replay = subparsers.add_parser("replay")
     replay.add_argument("--planner", choices=["classical", "neural"], required=True)
     replay.add_argument("--log-jsonl", required=True)
     replay.add_argument("--execute-actions", action="store_true")
+    replay.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
 
     return parser
+
+
+def _configure_logging(level_name: str) -> None:
+    """Configure process-wide runtime logging."""
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 async def _main_async(args: argparse.Namespace) -> int:
@@ -165,6 +192,8 @@ def main() -> int:
     if not args.command:
         parser.print_help()
         return 2
+    _configure_logging(getattr(args, "log_level", os.getenv("LOG_LEVEL", "INFO")))
+    _LOG.debug("CLI arguments parsed: %s", vars(args))
     return asyncio.run(_main_async(args))
 
 

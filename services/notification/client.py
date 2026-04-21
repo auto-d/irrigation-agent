@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -13,6 +14,7 @@ else:
     ClientSession = Any
 
 DEFAULT_DISCORD_USERNAME = "Yard Irrigation Agent"
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -72,11 +74,14 @@ class DiscordWebhookClient:
         """Deliver a message and optional metadata to Discord."""
         session = await self._ensure_session()
         body = self._build_payload(message, metadata=metadata)
+        _LOG.debug("Sending Discord webhook message")
 
         async with session.post(self._webhook_url, json=body) as response:
             text = await response.text()
             if response.status >= 400:
+                _LOG.error("Discord webhook delivery failed with status %s", response.status)
                 raise NotificationError(response.status, text.strip() or "unknown webhook error")
+        _LOG.info("Discord webhook delivery succeeded")
 
         return {
             "delivered": True,
