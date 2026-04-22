@@ -16,6 +16,12 @@ model. They are the minimum normalized residue needed to:
 - inspect, log, and regression-test planner behavior without coupling planner
   code directly to B-hyve, NWS, RTSP, or notification implementation details
 
+The replay path is intentionally strict and planner-facing. It is well-suited
+to structured scenario variation over normalized inputs, but it does not claim
+to simulate the full world. In practice, this means playback is used to stress
+planner behavior, while live mode and human inspection remain the higher-fidelity
+way to vet the integrated system when camera realism matters.
+
 ``Event`` and ``Decision`` capture planner-facing observations and outputs.
 ``PerceptionRequest`` / ``PerceptionResult`` and ``ActionRequest`` /
 ``ActionResult`` capture the interaction boundary the executor can log and
@@ -42,6 +48,55 @@ from typing import Any, Dict, List, Literal, Protocol
 ActionName = Literal["water_on", "water_off", "no_op", "notify"]
 
 _LOG = logging.getLogger(__name__)
+
+
+def _summarize_kwargs(kwargs: Dict[str, Any]) -> str:
+    """Render compact human-readable call arguments for runtime logs."""
+    if not kwargs:
+        return ""
+    parts = [f"{key}={value!r}" for key, value in sorted(kwargs.items())]
+    return ", ".join(parts)
+
+
+def _perceptor_label(name: str) -> str:
+    """Map perceptor ids to short human-facing labels."""
+    return {
+        "weather": "weather forecast",
+        "precipitation": "recent rainfall",
+        "irrigation": "irrigation status",
+        "camera": "lawn camera",
+    }.get(name, name)
+
+
+def _actor_label(name: str, action: str) -> str:
+    """Map actor/action pairs to short human-facing labels."""
+    if name == "irrigation":
+        return {
+            "water_on": "start watering",
+            "water_off": "stop watering",
+            "cycle": "cycle watering",
+        }.get(action, f"irrigation:{action}")
+    if name == "notification":
+        return "send Discord message"
+    return f"{name}:{action}"
+
+
+def _sanitize_for_log(value: Any) -> Any:
+    """Remove device identifiers and precise location data from JSONL artifacts."""
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"device_id", "id"}:
+                continue
+            if key in {"latitude", "longitude", "lat", "lon"}:
+                continue
+            if key == "coordinates":
+                continue
+            sanitized[key] = _sanitize_for_log(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_log(item) for item in value]
+    return value
 
 
 @dataclass
@@ -251,7 +306,7 @@ def event_from_dict(payload: Dict[str, Any]) -> Event:
 
 def append_jsonl(path: str | Path, record_type: str, payload: Dict[str, Any]) -> None:
     """Append one record to a JSONL log, creating parent directories as needed."""
-    record = {"record_type": record_type, **payload}
+    record = _sanitize_for_log({"record_type": record_type, **payload})
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     with path_obj.open("a", encoding="utf-8") as handle:
@@ -273,8 +328,13 @@ class PerceptionConfig:
     save_frame: str | None = None
     baseline_image_dir: str | None = None
     baseline_output: str | None = None
+    baseline_visualization_output: str | None = None
+    experiment_image_dir: str | None = None
+    experiment_output_dir: str | None = None
     score_image: str | None = None
     score_image_dir: str | None = None
+    score_visualization_output: str | None = None
+    camera_backend: str = "classic"
     notification_message: str | None = None
 
 
@@ -289,7 +349,7 @@ class ServicePerceptionProxy:
             ForecastPerceptor,
             HistoricalPrecipitationPerceptor,
             IrrigationPerceptor,
-            SecurityCameraPerceptor,
+            camera_perceptor_for_backend,
         )
         from services.notification import DiscordWebhookClient
 
@@ -323,14 +383,18 @@ class ServicePerceptionProxy:
             ):
                 results["camera"] = {"error": "camera URL required"}
             else:
-                results["camera"] = SecurityCameraPerceptor().probe_raw(
+                results["camera"] = camera_perceptor_for_backend(self._config.camera_backend).probe_raw(
                     self._config.camera_url,
                     sample_frames=self._config.sample_frames,
                     save_frame_path=self._config.save_frame,
                     baseline_image_dir=self._config.baseline_image_dir,
                     baseline_output_path=self._config.baseline_output,
+                    baseline_visualization_path=self._config.baseline_visualization_output,
+                    experiment_image_dir=self._config.experiment_image_dir,
+                    experiment_output_dir=self._config.experiment_output_dir,
                     score_image_path=self._config.score_image,
                     score_image_dir=self._config.score_image_dir,
+                    score_visualization_path=self._config.score_visualization_output,
                 )
 
         if target in {"notification", "all"}:
@@ -362,7 +426,7 @@ class ServicePerceptionProxy:
             ForecastPerceptor,
             HistoricalPrecipitationPerceptor,
             IrrigationPerceptor,
-            SecurityCameraPerceptor,
+            camera_perceptor_for_backend,
         )
 
         merged = self._merge_kwargs(kwargs)
@@ -388,14 +452,18 @@ class ServicePerceptionProxy:
                 and not merged["score_image_dir"]
             ):
                 raise RuntimeError("camera URL required")
-            return SecurityCameraPerceptor().perceive(
+            return camera_perceptor_for_backend(merged["camera_backend"]).perceive(
                 camera_url,
                 sample_frames=merged["sample_frames"],
                 save_frame_path=merged["save_frame"],
                 baseline_image_dir=merged["baseline_image_dir"],
                 baseline_output_path=merged["baseline_output"],
+                baseline_visualization_path=merged["baseline_visualization_output"],
+                experiment_image_dir=merged["experiment_image_dir"],
+                experiment_output_dir=merged["experiment_output_dir"],
                 score_image_path=merged["score_image"],
                 score_image_dir=merged["score_image_dir"],
+                score_visualization_path=merged["score_visualization_output"],
             )
         raise ValueError(f"Unknown perceptor: {perceptor}")
 
@@ -410,8 +478,17 @@ class ServicePerceptionProxy:
             "save_frame": kwargs.get("save_frame", self._config.save_frame),
             "baseline_image_dir": kwargs.get("baseline_image_dir", self._config.baseline_image_dir),
             "baseline_output": kwargs.get("baseline_output", self._config.baseline_output),
+            "baseline_visualization_output": kwargs.get(
+                "baseline_visualization_output", self._config.baseline_visualization_output
+            ),
+            "experiment_image_dir": kwargs.get("experiment_image_dir", self._config.experiment_image_dir),
+            "experiment_output_dir": kwargs.get("experiment_output_dir", self._config.experiment_output_dir),
             "score_image": kwargs.get("score_image", self._config.score_image),
             "score_image_dir": kwargs.get("score_image_dir", self._config.score_image_dir),
+            "score_visualization_output": kwargs.get(
+                "score_visualization_output", self._config.score_visualization_output
+            ),
+            "camera_backend": kwargs.get("camera_backend", self._config.camera_backend),
         }
 
     def _targets_to_perceptors(self, target: str) -> List[str]:
@@ -449,34 +526,34 @@ class IrrigationActor:
 
         if action == "water_on":
             duration_seconds = float(kwargs.get("duration_seconds") or 300)
-            _LOG.info("Irrigation action requested: start watering for %.1f seconds", duration_seconds)
+            _LOG.info("Starting watering for %.0f seconds", duration_seconds)
             async with controller_from_env() as controller:
                 sprinkler = controller.list_sprinkler_devices()[0]
                 result = await controller.turn_on(
                     str(sprinkler["id"]),
                     seconds=duration_seconds,
                 )
-            _LOG.info("Irrigation action completed: start watering")
+            _LOG.info("Watering command sent")
             return ActionResult(timestamp=now, actor=self.name, action=action, status="executed", detail={"result": result})
 
         if action == "water_off":
-            _LOG.info("Irrigation action requested: stop watering")
+            _LOG.info("Stopping watering")
             async with controller_from_env() as controller:
                 sprinkler = controller.list_sprinkler_devices()[0]
                 result = await controller.turn_off(str(sprinkler["id"]))
-            _LOG.info("Irrigation action completed: stop watering")
+            _LOG.info("Stop-watering command sent")
             return ActionResult(timestamp=now, actor=self.name, action=action, status="executed", detail={"result": result})
 
         if action == "cycle":
             duration_seconds = float(kwargs.get("duration_seconds") or 5)
-            _LOG.info("Irrigation action requested: cycle watering for %.1f seconds", duration_seconds)
+            _LOG.info("Cycling watering for %.0f seconds", duration_seconds)
             async with controller_from_env() as controller:
                 sprinkler = controller.list_sprinkler_devices()[0]
                 result = await controller.cycle(
                     str(sprinkler["id"]),
                     seconds=duration_seconds,
                 )
-            _LOG.info("Irrigation action completed: cycle watering")
+            _LOG.info("Cycle-watering command sent")
             return ActionResult(timestamp=now, actor=self.name, action=action, status="executed", detail={"result": result})
 
         raise ValueError(f"Unsupported irrigation action: {action}")
@@ -499,10 +576,10 @@ class NotificationActor:
             raise ValueError("NotificationActor.send requires a non-empty message")
 
         metadata = kwargs.get("metadata")
-        _LOG.info("Notification requested: %s", message[:120])
+        _LOG.info("Sending Discord message: %s", message[:120])
         async with DiscordWebhookClient.from_env() as client:
             result = await client.send(message, metadata=metadata if isinstance(metadata, dict) else None)
-        _LOG.info("Notification delivered via Discord")
+        _LOG.info("Discord message delivered")
 
         return ActionResult(
             timestamp=now,
@@ -538,7 +615,12 @@ class LiveExecutorProxy:
     async def perceive(self, perceptor: str, **kwargs: Any) -> Event:
         if perceptor not in self._perceptors:
             raise ValueError(f"Unknown perceptor: {perceptor}")
-        _LOG.debug("Perception requested: planner=%s perceptor=%s kwargs=%s", self._planner_name, perceptor, kwargs)
+        details = _summarize_kwargs(kwargs)
+        if details:
+            _LOG.info("Asking for %s (%s)", _perceptor_label(perceptor), details)
+        else:
+            _LOG.info("Asking for %s", _perceptor_label(perceptor))
+        _LOG.debug("Perception request: planner=%s perceptor=%s kwargs=%s", self._planner_name, perceptor, kwargs)
         request = PerceptionRequest(
             timestamp=dt.datetime.now(dt.timezone.utc),
             planner=self._planner_name,
@@ -557,7 +639,7 @@ class LiveExecutorProxy:
         )
         self._append("perception_result", {"perception_result": perception_result_to_dict(result)})
         self.perception_count += 1
-        _LOG.info(
+        _LOG.debug(
             "Perception completed: planner=%s perceptor=%s event=%s/%s",
             self._planner_name,
             perceptor,
@@ -569,8 +651,13 @@ class LiveExecutorProxy:
     async def act(self, actor: str, action: str, **kwargs: Any) -> ActionResult:
         if actor not in self._actors:
             raise ValueError(f"Unknown actor: {actor}")
-        _LOG.info(
-            "Action requested: planner=%s actor=%s action=%s kwargs=%s",
+        details = _summarize_kwargs(kwargs)
+        if details:
+            _LOG.info("Action: %s (%s)", _actor_label(actor, action), details)
+        else:
+            _LOG.info("Action: %s", _actor_label(actor, action))
+        _LOG.debug(
+            "Action request: planner=%s actor=%s action=%s kwargs=%s",
             self._planner_name,
             actor,
             action,
@@ -596,7 +683,7 @@ class LiveExecutorProxy:
             result = await self._actors[actor].execute(action, **kwargs)
         self._append("action_result", {"action_result": action_result_to_dict(result)})
         self.action_count += 1
-        _LOG.info(
+        _LOG.debug(
             "Action completed: planner=%s actor=%s action=%s status=%s",
             self._planner_name,
             actor,
@@ -611,51 +698,124 @@ class LiveExecutorProxy:
 
 
 class ReplayExecutorProxy:
-    """Proxy that replays previously logged perception/action calls."""
+    """Proxy that replays previously logged perception/action calls.
 
-    def __init__(self, *, planner_name: str, records: List[Dict[str, Any]], execute_actions: bool) -> None:
+    Replay is planner-facing rather than transcript-facing: a planner may ask
+    for recorded observations in a different order than the live run that
+    produced them. We therefore serve matching recorded interactions from a
+    pool, refreshing timestamps as they are replayed so the planner sees a
+    coherent current episode rather than a stale historical sequence.
+    """
+
+    def __init__(
+        self,
+        *,
+        planner_name: str,
+        records: List[Dict[str, Any]],
+        execute_actions: bool,
+        now: datetime,
+    ) -> None:
         self._planner_name = planner_name
-        self._records = records
         self._execute_actions = execute_actions
-        self._index = 0
         self.perception_count = 0
         self.action_count = 0
+        self._replay_time = now
+        self._perception_pairs = self._collect_pairs(records, "perception_request", "perception_result")
+        self._action_pairs = self._collect_pairs(records, "action_request", "action_result")
 
     async def perceive(self, perceptor: str, **kwargs: Any) -> Event:
-        # Replay is strict about call order so planner behavior remains
-        # comparable between live execution and offline evaluation.
-        request_record = self._next_record("perception_request")
-        request = request_record["perception_request"]
-        if request["perceptor"] != perceptor:
-            raise RuntimeError(f"Replay mismatch: expected perceptor {request['perceptor']}, got {perceptor}")
-        result_record = self._next_record("perception_result")
-        result = result_record["perception_result"]
+        pair = self._consume_perception_pair(perceptor, kwargs)
+        result = pair["result"]["perception_result"]
         self.perception_count += 1
-        return event_from_dict(result["event"])
+        event = event_from_dict(result["event"])
+        event.timestamp = self._next_timestamp()
+        return event
 
     async def act(self, actor: str, action: str, **kwargs: Any) -> ActionResult:
-        request_record = self._next_record("action_request")
-        request = request_record["action_request"]
-        if request["actor"] != actor or request["action"] != action:
-            raise RuntimeError(
-                f"Replay mismatch: expected {request['actor']}.{request['action']}, got {actor}.{action}"
-            )
-        result_record = self._next_record("action_result")
-        result = dict(result_record["action_result"])
-        result["timestamp"] = datetime.fromisoformat(result["timestamp"])
+        pair = self._consume_action_pair(actor, action, kwargs)
+        result = dict(pair["result"]["action_result"])
+        result["timestamp"] = self._next_timestamp()
         if not self._execute_actions:
             result["status"] = "dry_run"
             result["detail"] = {"reason": "replay action emission disabled", "recorded": result["detail"]}
         self.action_count += 1
         return ActionResult(**result)
 
-    def _next_record(self, record_type: str) -> Dict[str, Any]:
-        while self._index < len(self._records):
-            record = self._records[self._index]
-            self._index += 1
-            if record.get("record_type") == record_type:
-                return record
-        raise RuntimeError(f"Replay log exhausted while looking for {record_type}")
+    @staticmethod
+    def _collect_pairs(records: List[Dict[str, Any]], request_type: str, result_type: str) -> List[Dict[str, Any]]:
+        """Pair recorded requests with their corresponding results."""
+        pairs: List[Dict[str, Any]] = []
+        pending_request: Dict[str, Any] | None = None
+        for record in records:
+            record_type = record.get("record_type")
+            if record_type == request_type:
+                pending_request = record
+            elif record_type == result_type:
+                if pending_request is None:
+                    continue
+                pairs.append({"request": pending_request, "result": record})
+                pending_request = None
+        return pairs
+
+    def _consume_perception_pair(self, perceptor: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return one matching recorded perception interaction."""
+        return self._consume_pair(
+            pool=self._perception_pairs,
+            matcher=lambda pair: pair["request"]["perception_request"]["perceptor"] == perceptor,
+            strict_matcher=lambda pair: (
+                pair["request"]["perception_request"]["perceptor"] == perceptor
+                and self._normalize_kwargs(pair["request"]["perception_request"].get("kwargs", {}))
+                == self._normalize_kwargs(kwargs)
+            ),
+            label=f"perception {perceptor}",
+        )
+
+    def _consume_action_pair(self, actor: str, action: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return one matching recorded action interaction."""
+        return self._consume_pair(
+            pool=self._action_pairs,
+            matcher=lambda pair: (
+                pair["request"]["action_request"]["actor"] == actor
+                and pair["request"]["action_request"]["action"] == action
+            ),
+            strict_matcher=lambda pair: (
+                pair["request"]["action_request"]["actor"] == actor
+                and pair["request"]["action_request"]["action"] == action
+                and self._normalize_kwargs(pair["request"]["action_request"].get("kwargs", {}))
+                == self._normalize_kwargs(kwargs)
+            ),
+            label=f"action {actor}.{action}",
+        )
+
+    def _consume_pair(
+        self,
+        *,
+        pool: List[Dict[str, Any]],
+        matcher: Any,
+        strict_matcher: Any,
+        label: str,
+    ) -> Dict[str, Any]:
+        """Consume one matching request/result pair from a replay pool."""
+        for index, pair in enumerate(pool):
+            if strict_matcher(pair):
+                return pool.pop(index)
+
+        fallback_matches = [index for index, pair in enumerate(pool) if matcher(pair)]
+        if len(fallback_matches) == 1:
+            return pool.pop(fallback_matches[0])
+        if len(fallback_matches) > 1:
+            raise RuntimeError(f"Replay is ambiguous for {label}: multiple recorded candidates remain")
+        raise RuntimeError(f"Replay log has no recorded candidate for {label}")
+
+    @staticmethod
+    def _normalize_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize kwargs for replay matching."""
+        return _sanitize_for_log(kwargs)
+
+    def _next_timestamp(self) -> datetime:
+        """Issue a fresh monotonic timestamp for replayed interactions."""
+        self._replay_time = self._replay_time + timedelta(milliseconds=1)
+        return self._replay_time
 
 
 class PlannerExecutor:
@@ -676,17 +836,28 @@ class PlannerExecutor:
             "notification": NotificationActor(),
         }
         self._log_jsonl = log_jsonl
+        self._log_initialized = False
+
+    def _prepare_log(self) -> None:
+        """Start each live run with a fresh JSONL log file."""
+        if not self._log_jsonl or self._log_initialized:
+            return
+        path = Path(self._log_jsonl)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        self._log_initialized = True
 
     async def tick(self, tick_index: int, *, execute_actions: bool) -> Dict[str, Any]:
         if self._perception_proxy is None:
             raise RuntimeError("Live ticks require a perception proxy.")
+        self._prepare_log()
 
         tick_time = dt.datetime.now(dt.timezone.utc)
         _LOG.info(
-            "Tick started: planner=%s tick_index=%s execute_actions=%s",
-            self._planner.name,
+            "Tick %s started with %s planner%s",
             tick_index,
-            execute_actions,
+            self._planner.name,
+            "" if execute_actions else " (actions disabled)",
         )
         tick_event = Event(
             timestamp=tick_time,
@@ -707,8 +878,7 @@ class PlannerExecutor:
         result = await self._planner.run(proxy, now=tick_time)
         self._append("planner_run", {"planner_run": planner_run_result_to_dict(result)})
         _LOG.info(
-            "Tick completed: planner=%s tick_index=%s decision=%s perceptions=%s actions=%s rationale=%s",
-            self._planner.name,
+            "Tick %s decision: %s after %s perception call(s) and %s action(s): %s",
             tick_index,
             result.decision.action,
             result.perception_count,
@@ -734,7 +904,12 @@ class PlannerExecutor:
 
     async def replay(self, log_jsonl: str, *, execute_actions: bool) -> List[Dict[str, Any]]:
         """Replay each logged tick as one planner episode."""
-        _LOG.info("Replay started: planner=%s log=%s execute_actions=%s", self._planner.name, log_jsonl, execute_actions)
+        _LOG.info(
+            "Replaying %s with %s planner%s",
+            log_jsonl,
+            self._planner.name,
+            "" if execute_actions else " (actions disabled)",
+        )
         records = [
             json.loads(line)
             for line in Path(log_jsonl).read_text(encoding="utf-8").splitlines()
@@ -756,23 +931,23 @@ class PlannerExecutor:
         for episode in episodes:
             tick_record = episode[0]
             tick_event = event_from_dict(tick_record["event"])
-            _LOG.info("Replay tick started: planner=%s tick_time=%s", self._planner.name, tick_event.timestamp.isoformat())
+            _LOG.info("Replay tick at %s", tick_event.timestamp.isoformat())
             proxy = ReplayExecutorProxy(
                 planner_name=self._planner.name,
                 records=episode[1:],
                 execute_actions=execute_actions,
+                now=tick_event.timestamp,
             )
             result = await self._planner.run(proxy, now=tick_event.timestamp)
             results.append(planner_run_result_to_dict(result))
             _LOG.info(
-                "Replay tick completed: planner=%s decision=%s perceptions=%s actions=%s rationale=%s",
-                self._planner.name,
+                "Replay decision: %s after %s perception call(s) and %s action(s): %s",
                 result.decision.action,
                 result.perception_count,
                 result.action_count,
                 result.decision.rationale,
             )
-        _LOG.info("Replay completed: planner=%s episodes=%s", self._planner.name, len(results))
+        _LOG.info("Replay completed: %s episode(s)", len(results))
         return results
 
     def _append(self, record_type: str, payload: Dict[str, Any]) -> None:

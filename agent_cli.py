@@ -43,6 +43,11 @@ def _build_planner(name: str):
 
 def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
     """Translate CLI flags into shared perceptor configuration."""
+    camera_backend = getattr(args, "camera_backend", None)
+    if camera_backend is None and getattr(args, "planner", None) == "neural":
+        camera_backend = "neural"
+    if camera_backend is None:
+        camera_backend = "classic"
     return PerceptionConfig(
         lat=args.lat,
         lon=args.lon,
@@ -55,8 +60,13 @@ def _perception_config_from_args(args: argparse.Namespace) -> PerceptionConfig:
         save_frame=getattr(args, "save_frame", None),
         baseline_image_dir=getattr(args, "baseline_image_dir", None),
         baseline_output=getattr(args, "baseline_output", None),
+        baseline_visualization_output=getattr(args, "baseline_viz_output", None),
+        experiment_image_dir=getattr(args, "experiment_image_dir", None),
+        experiment_output_dir=getattr(args, "experiment_output_dir", None),
         score_image=getattr(args, "score_image", None),
         score_image_dir=getattr(args, "score_image_dir", None),
+        score_visualization_output=getattr(args, "score_viz_output", None),
+        camera_backend=camera_backend,
         notification_message=getattr(args, "message", None),
     )
 
@@ -87,12 +97,17 @@ def _build_parser() -> argparse.ArgumentParser:
     service.add_argument("--forecast-days", type=int)
     service.add_argument("--window", default="24H")
     service.add_argument("--camera-url")
+    service.add_argument("--camera-backend", choices=["classic", "neural"])
     service.add_argument("--sample-frames", type=int, default=1)
     service.add_argument("--save-frame")
     service.add_argument("--baseline-image-dir")
     service.add_argument("--baseline-output")
+    service.add_argument("--baseline-viz-output")
+    service.add_argument("--experiment-image-dir")
+    service.add_argument("--experiment-output-dir")
     service.add_argument("--score-image")
     service.add_argument("--score-image-dir")
+    service.add_argument("--score-viz-output")
     service.add_argument("--message")
 
     perception = probe_sub.add_parser("perception")
@@ -104,12 +119,17 @@ def _build_parser() -> argparse.ArgumentParser:
     perception.add_argument("--forecast-days", type=int)
     perception.add_argument("--window", default="24H")
     perception.add_argument("--camera-url")
+    perception.add_argument("--camera-backend", choices=["classic", "neural"])
     perception.add_argument("--sample-frames", type=int, default=3)
     perception.add_argument("--save-frame")
     perception.add_argument("--baseline-image-dir")
     perception.add_argument("--baseline-output")
+    perception.add_argument("--baseline-viz-output")
+    perception.add_argument("--experiment-image-dir")
+    perception.add_argument("--experiment-output-dir")
     perception.add_argument("--score-image")
     perception.add_argument("--score-image-dir")
+    perception.add_argument("--score-viz-output")
 
     run = subparsers.add_parser("run")
     run.add_argument("--planner", choices=["classical", "neural"], required=True)
@@ -120,6 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--forecast-days", type=int)
     run.add_argument("--window", default="24H")
     run.add_argument("--camera-url")
+    run.add_argument("--camera-backend", choices=["classic", "neural"])
     run.add_argument("--sample-frames", type=int, default=3)
     run.add_argument("--tick-seconds", type=float, default=60.0)
     run.add_argument("--ticks", type=int)

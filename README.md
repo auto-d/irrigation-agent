@@ -104,6 +104,8 @@ The system depends on real-world cues and developments that occur over long-ish 
 1) we tightly control the interface specifications between planner and its perceptions and actions, yielding a common language that can be simulated, inspected and hacked to assemble interesting counter-factuals (see [representations](#representations))
 2) we employ a unified scheme for real-time execution and historical event playback that ensures our evaluations pass through the same planner code paths during both modes
 
+There is, however, a practical asymmetry between symbolic signals and the camera stream. Rainfall totals, forecast summaries and irrigation state are all amenable to structured perturbation. Vision is not. We can replay a recorded camera-derived event, but that is not the same thing as varying the real visual world in a convincing way. Rather than pretend otherwise, we split evaluation into two complementary modes: playback to flex planners across many structured scenarios, and smaller-scale human inspection of live runs to vet the integrated system where camera inputs remain real.
+
 ### Bimodal Operation
 
 We model the system as a **tick-indexed planning loop** with a strict separation between:
@@ -139,7 +141,7 @@ Properties:
 
 - strict planner I/O ordering
 - deterministic
-- used for evaluation and regression testing
+- used for evaluation and regression testing of the planner-facing interface
 
 Dataset generation: 
 
@@ -161,6 +163,8 @@ for tick_index in range(tick_count):
     sleep(tick_seconds)
 ```
 
+Live mode is also the place where we rely on human inspection. In particular, if we care about how the camera/perception path and planner behave as a unit, there is no cheap substitute for observing real frames, saved captures, runtime logs and emitted decisions under real operating conditions.
+
 ## System Operation 
 
 The system is currently exercised through a unified CLI:
@@ -172,13 +176,24 @@ The system is currently exercised through a unified CLI:
 
 ## Evaluation 
 
-Evaluation presently hinges on playback consistency and inspection of planner residue:
+Evaluation is intentionally split in two:
+
+- **Playback mode** is used to cover many structured scenarios without waiting for the real world to cooperate.
+- **Live mode with human inspection** is used to vet the integrated system where camera realism and perception quality matter.
+
+Playback evaluation presently hinges on:
 
 - whether the planner reaches a coherent decision for each replayed tick
 - whether perception/action call ordering remains stable across code changes
-- whether the emitted decision and resulting action trace remain acceptable under known scenarios
+- whether the emitted decision and resulting action trace remain acceptable under known structured scenarios
 
-This is not yet a full scoring harness, but the replay path gives us a clean mechanism for regression tests and for assembling adversarial or counterfactual episodes without touching live infrastructure.
+Live evaluation presently hinges on:
+
+- whether the runtime logs, saved frames and emitted actions make sense to a human observer
+- whether the camera/perception path and planner appear to work sensibly together in real conditions
+- whether the system behaves conservatively when the world is messy or ambiguous
+
+This is not yet a full scoring harness, but it is an honest one. Playback gives us a clean mechanism for regression tests and counterfactual planner scenarios without touching live infrastructure, while live mode gives us smaller-scale but higher-fidelity inspection of the end-to-end system.
 
 ## Backing Services
 
