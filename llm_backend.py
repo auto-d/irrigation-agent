@@ -25,14 +25,25 @@ class Backend:
         """Create a deep copy of this instance."""
         return Backend(self.api_key, self.model, copy.deepcopy(self.reasoning))
 
-    def send(self, messages: List[Dict[str, Any]], instructions: str | None = None, tools: List[Dict[str, Any]] | None = None) -> Any:
+    def send(
+        self,
+        messages: List[Dict[str, Any]],
+        instructions: str | None = None,
+        tools: List[Dict[str, Any]] | None = None,
+        text_format: Dict[str, Any] | None = None,
+    ) -> Any:
         """Send the current conversation to the Responses API."""
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": messages,
+            "reasoning": self.reasoning,
+            "tools": tools,
+        }
+        if text_format is not None:
+            kwargs["text"] = {"format": text_format}
         return self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=messages,
-            reasoning=self.reasoning,
-            tools=tools,
+            **kwargs,
         )
 
     def unpack_response(self, response: Any, include_reasoning: bool = False) -> tuple[List[str], List[Any]]:

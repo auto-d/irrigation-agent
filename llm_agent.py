@@ -129,7 +129,13 @@ class LlmAgent:
         self.memory = Memory(backend=backend)
         self.memory.append_developer(dev_msgs or [])
 
-    async def chat(self, messages: List[str], tools: List[Tool] | None = None, trace: bool = False) -> List[str]:
+    async def chat(
+        self,
+        messages: List[str],
+        tools: List[Tool] | None = None,
+        trace: bool = False,
+        text_format: Dict[str, Any] | None = None,
+    ) -> List[str]:
         """Send user messages to the backend and satisfy any returned tool calls."""
         self.memory.append_user(messages)
 
@@ -147,7 +153,11 @@ class LlmAgent:
             if self.backend is None:
                 raise RuntimeError("chat() requested but no backend configured for this agent")
 
-            response = self.backend.send(self.memory.messages, tools=tool_schemas)
+            response = self.backend.send(
+                self.memory.messages,
+                tools=tool_schemas,
+                text_format=text_format,
+            )
             text, tool_calls = self.backend.unpack_response(response)
             self.memory.append_response_output(response.output)
 

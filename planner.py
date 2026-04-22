@@ -320,6 +320,7 @@ class PerceptionConfig:
     lat: float | None = None
     lon: float | None = None
     infer_location: bool = False
+    suppress_irrigation_state: bool = False
     forecast_hours: int | None = None
     forecast_days: int | None = None
     precipitation_window: str = "24H"
@@ -372,7 +373,13 @@ class ServicePerceptionProxy:
             )
 
         if target in {"irrigation", "all"}:
-            results["irrigation"] = await IrrigationPerceptor().probe_raw()
+            if self._config.suppress_irrigation_state:
+                results["irrigation"] = {
+                    "suppressed": True,
+                    "reason": "irrigation state probing disabled by CLI flag",
+                }
+            else:
+                results["irrigation"] = await IrrigationPerceptor().probe_raw()
 
         if target in {"camera", "all"}:
             if (
@@ -442,6 +449,8 @@ class ServicePerceptionProxy:
         if perceptor == "precipitation":
             return await HistoricalPrecipitationPerceptor().perceive(merged["window"])
         if perceptor == "irrigation":
+            if self._config.suppress_irrigation_state:
+                return self._suppressed_irrigation_event()
             return await IrrigationPerceptor().perceive()
         if perceptor == "camera":
             camera_url = merged["camera_url"]
@@ -469,9 +478,20 @@ class ServicePerceptionProxy:
 
     def _merge_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Overlay per-call overrides on top of the shared config."""
+        forecast_hours = kwargs.get("forecast_hours", self._config.forecast_hours)
+        forecast_days = kwargs.get("forecast_days", self._config.forecast_days)
+
+        # Forecast windows are mutually exclusive. If a per-call override
+        # specifies one side, clear the other rather than inheriting it from
+        # the shared run configuration.
+        if "forecast_hours" in kwargs and "forecast_days" not in kwargs:
+            forecast_days = None
+        elif "forecast_days" in kwargs and "forecast_hours" not in kwargs:
+            forecast_hours = None
+
         return {
-            "forecast_hours": kwargs.get("forecast_hours", self._config.forecast_hours),
-            "forecast_days": kwargs.get("forecast_days", self._config.forecast_days),
+            "forecast_hours": forecast_hours,
+            "forecast_days": forecast_days,
             "window": kwargs.get("window", self._config.precipitation_window),
             "camera_url": kwargs.get("camera_url", self._config.camera_url),
             "sample_frames": kwargs.get("sample_frames", self._config.sample_frames),
@@ -496,6 +516,26 @@ class ServicePerceptionProxy:
         if target == "all":
             return ["weather", "precipitation", "irrigation", "camera"]
         return [target]
+
+    @staticmethod
+    def _suppressed_irrigation_event() -> Event:
+        """Return a synthetic irrigation event without touching the backend."""
+        return Event(
+            timestamp=dt.datetime.now(dt.timezone.utc),
+            source="irrigation",
+            type="irrigation_status",
+            payload={
+                "connected": None,
+                "run_mode": "suppressed",
+                "api_reports_on": False,
+                "expected_on": False,
+                "watered_within_24h": False,
+                "matching_programs": [],
+                "next_start_time": None,
+                "next_start_programs": [],
+                "suppressed": True,
+            },
+        )
 
     async def _resolve_lat_lon(self) -> tuple[float, float] | None:
         """Resolve coordinates from flags or the configured B-hyve device."""

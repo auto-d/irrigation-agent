@@ -81,6 +81,11 @@ Verification notes:
 - Websocket acknowledgements from Orbit are unreliable for this device path.
 - REST polling is available as secondary evidence with `--poll`, but should not be treated as the primary proof that the valve moved.
 
+Known issue:
+
+- The HT25 backend state can lag briefly behind manual actuation. In practice a freshly issued watering command may open the valve before the Orbit API updates the device payload to reflect `run_mode: "manual"` and an in-progress `watering_status`. This does not appear to be a long-lived discrepancy, but planner logic should treat immediate post-command reads as eventually consistent rather than perfectly synchronous.
+- This lag is not operationally significant for our current control loop: issuing another `water_on` command while the valve is already open does not materially change system behavior for this use case.
+
 Provenance:
 
 - `services/bhyve/controller.py` and the CLI shape are project code for this repo.
@@ -317,6 +322,26 @@ python -m services.rtsp.ingest \
   --display \
   --debug-max-saved 0
 ```
+
+Live anomaly overlay mode:
+
+```bash
+python -m services.rtsp.ingest \
+  --url 'rtsps://camera.example.local:7441/your-stream-path' \
+  --display \
+  --debug-max-saved 0 \
+  --detector-baseline-dir vision_baseline \
+  --detector-mode baseline_suppressed_combo \
+  --detector-refresh-every 5
+```
+
+That mode builds the classical baseline from `vision_baseline`, overlays the anomaly heatmap on the live feed, and draws threshold-aware candidate boxes:
+
+- `orange`: the selected region meets the learned obstacle threshold and would trip the downstream obstacle classifier
+- `green`: the selected region is below the obstacle threshold
+- `gray`: other candidate regions for context
+
+If your live feed is a different resolution than the baseline stills, the helper now resizes frames for scoring and projects the resulting heatmap and boxes back onto the displayed stream.
 
 Continuous ingest without display or debug writes:
 

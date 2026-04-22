@@ -31,7 +31,7 @@ Connectivity with the world enables the agent to gauge context and plan before i
 
 #### Perception 
 
-The perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and irrigation controller state. We bypass neural perception for precipitation and forecasts. The camera path is presently a lightweight scene abstraction built from frame statistics and sampled captures rather than a full semantic vision stack, but the interface is intentionally shaped so richer classical or neural vision modules can slot in later without perturbing the planner contract. 
+The perception layer operates off security camera footage of the lawn, historical precipitation, near-term forecast data and irrigation controller state. We bypass neural perception for precipitation and forecasts. The camera path is now split into a classical and neural implementation behind a common interface: the classical path remains a lightweight scene abstraction and anomaly-oriented pipeline built from sampled captures, while the neural path submits a still image to a multimodal model and requests a constrained classification. This lets us compare planners without also entangling them with one monolithic vision implementation. 
 
 **Classical Planner:** We employ behavior trees due to the relatively limited number of states we have to transition through, the potential for significant increase in states with async events and actions (suggests composability would be useful), and their intuitive nature. Here's a simplified tree that satisifies our agent's task: 
 
@@ -128,7 +128,7 @@ This is less elegant on paper than a universal event bus, but it matches the act
 
 #### Offline (Evaluation mode) 
 
-Offline mode replays a previously recorded JSONL trajectory. Each tick forms one planner episode, and the replay proxy satisfies perception and action calls in the exact order they were originally observed.
+Offline mode replays a previously recorded JSONL trajectory. Each tick forms one planner episode, and the replay proxy satisfies perception and action calls from the pool of observations and action results recorded for that episode. This is strict about *what* information is available, but more permissive about *when* the planner asks for it. That matters for the neural planner, whose sensing order is not stable enough to treat as part of the contract.
 
 ```
 for episode in recorded_episodes:
@@ -139,8 +139,8 @@ for episode in recorded_episodes:
 
 Properties:
 
-- strict planner I/O ordering
-- deterministic
+- deterministic with respect to the recorded planner-facing residue
+- strict about unavailable observations and actions, but not about one exact sensing order
 - used for evaluation and regression testing of the planner-facing interface
 
 Dataset generation: 
@@ -173,6 +173,7 @@ The system is currently exercised through a unified CLI:
 - `probe perception ...` emits normalized planner-facing events
 - `run --planner classical|neural ...` executes live ticks and can optionally actuate
 - `replay --planner classical|neural --log-jsonl ...` reruns the planner against a recorded trajectory
+- `eval --planner classical|neural|both` replays the known eval corpus and emits planner-level metrics
 
 ## Evaluation 
 
@@ -184,8 +185,8 @@ Evaluation is intentionally split in two:
 Playback evaluation presently hinges on:
 
 - whether the planner reaches a coherent decision for each replayed tick
-- whether perception/action call ordering remains stable across code changes
-- whether the emitted decision and resulting action trace remain acceptable under known structured scenarios
+- whether the planner asks only for observations and actions that the scenario actually contains
+- whether the emitted decision remains acceptable under known structured scenarios
 
 Live evaluation presently hinges on:
 
@@ -193,7 +194,21 @@ Live evaluation presently hinges on:
 - whether the camera/perception path and planner appear to work sensibly together in real conditions
 - whether the system behaves conservatively when the world is messy or ambiguous
 
-This is not yet a full scoring harness, but it is an honest one. Playback gives us a clean mechanism for regression tests and counterfactual planner scenarios without touching live infrastructure, while live mode gives us smaller-scale but higher-fidelity inspection of the end-to-end system.
+The `eval` CLI mode now computes simple binary watering metrics across the known `eval_cases` corpus:
+
+- `tp`: watered when appropriate
+- `fp`: watered when inappropriate
+- `fn`: aborted when it should have watered
+- `tn`: correctly left watering off
+- `accuracy`: `(tp + tn) / cases_total`, so replay/runtime errors count against accuracy as failed classifications
+- `precision`
+- `error_count`: cases that failed to classify due to replay/runtime errors
+
+The eval command also writes one confusion-matrix image per planner under `eval_cases/confusion_matrices/`. Those images remain a standard 2x2 matrix over successfully scored cases, but the title includes total cases, scored cases, and error count so the figure cannot be confused with full-corpus accuracy.
+
+Replay failures are still surfaced separately in the JSON output. In practice this is useful for the neural planner, where a case may fail not because the final watering decision was wrong, but because the planner requested an observation or action that the scenario did not include.
+
+This is still not a full scoring harness, but it is an honest one. Playback gives us a clean mechanism for regression tests and counterfactual planner scenarios without touching live infrastructure, while live mode gives us smaller-scale but higher-fidelity inspection of the end-to-end system.
 
 ## Backing Services
 

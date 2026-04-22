@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any
 
 import cv2
 import numpy as np
@@ -133,6 +134,226 @@ class DebugFrameWriter:
             raise RuntimeError(f"failed to write debug frame to {filename}")
         self.saved_count += 1
         print(f"saved_debug_frame path={filename} src_frame={frame_count} elapsed={elapsed:.2f}s")
+
+
+class LiveAnomalyOverlay:
+    def __init__(
+        self,
+        *,
+        baseline_image_dir,
+        mode,
+        refresh_every,
+        alpha,
+    ):
+        from classic_perception import SecurityCameraPerceptor
+
+        self._perceptor = SecurityCameraPerceptor()
+        baseline_dir = Path(baseline_image_dir).expanduser().resolve()
+        self._cache_path = baseline_dir / "live_detector_baseline.npz"
+        self._reference, self._positive_threshold, self._type_threshold = self._load_or_build_reference(baseline_dir)
+        self._method = self._perceptor._experiment_methods(self._reference)[mode]
+        self._mode = mode
+        self._refresh_every = max(1, int(refresh_every))
+        self._alpha = float(np.clip(alpha, 0.0, 1.0))
+        self._last_result = None
+        self._reference_height = int(self._reference["median_bgr"].shape[0])
+        self._reference_width = int(self._reference["median_bgr"].shape[1])
+
+    def _load_or_build_reference(self, baseline_dir):
+        if self._cache_path.is_file():
+            payload = np.load(self._cache_path)
+            reference = {
+                "median_bgr": payload["median_bgr"].astype(np.float32),
+                "median_lab": payload["median_lab"].astype(np.float32),
+                "median_gray": payload["median_gray"].astype(np.float32),
+                "median_blur": payload["median_blur"].astype(np.float32),
+                "median_grad": payload["median_grad"].astype(np.float32),
+                "nuisance_heatmap": payload["nuisance_heatmap"].astype(np.float32),
+                "spatial_prior": payload["spatial_prior"].astype(np.float32),
+                "reliability_map": payload["reliability_map"].astype(np.float32),
+            }
+            positive_threshold = None
+            type_threshold = None
+            if "positive_threshold" in payload.files:
+                loaded_positive_threshold = float(payload["positive_threshold"])
+                if loaded_positive_threshold >= 0.0:
+                    positive_threshold = loaded_positive_threshold
+            if "type_threshold" in payload.files:
+                loaded_type_threshold = float(payload["type_threshold"])
+                if loaded_type_threshold >= 0.0:
+                    type_threshold = loaded_type_threshold
+            print(f"live_detector_cache loaded path={self._cache_path}")
+            return reference, positive_threshold, type_threshold
+
+        reference = self._perceptor._build_background_reference(str(baseline_dir))
+        positive_threshold = None
+        type_threshold = None
+        labeled_dir = baseline_dir / "labeled_images"
+        if labeled_dir.is_dir():
+            methods = self._perceptor._experiment_methods(reference)
+            suppressed_records = self._perceptor._classifier_records(
+                self._perceptor._list_image_paths(str(labeled_dir)),
+                methods["baseline_suppressed_combo"],
+            )
+            positive_threshold = self._perceptor._fit_positive_threshold(suppressed_records)
+            type_threshold = self._perceptor._fit_type_threshold(
+                suppressed_records,
+                positive_threshold=positive_threshold,
+            )
+
+        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            self._cache_path,
+            median_bgr=reference["median_bgr"],
+            median_lab=reference["median_lab"],
+            median_gray=reference["median_gray"],
+            median_blur=reference["median_blur"],
+            median_grad=reference["median_grad"],
+            nuisance_heatmap=reference["nuisance_heatmap"],
+            spatial_prior=reference["spatial_prior"],
+            reliability_map=reference["reliability_map"],
+            positive_threshold=np.array(-1.0 if positive_threshold is None else positive_threshold, dtype=np.float32),
+            type_threshold=np.array(-1.0 if type_threshold is None else type_threshold, dtype=np.float32),
+        )
+        print(f"live_detector_cache wrote path={self._cache_path}")
+        return reference, positive_threshold, type_threshold
+
+    def _score_frame(self, frame):
+        if frame.shape[0] == self._reference_height and frame.shape[1] == self._reference_width:
+            return frame, 1.0, 1.0
+        scored_frame = cv2.resize(
+            frame,
+            (self._reference_width, self._reference_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        scale_x = float(frame.shape[1]) / max(float(self._reference_width), 1.0)
+        scale_y = float(frame.shape[0]) / max(float(self._reference_height), 1.0)
+        return scored_frame, scale_x, scale_y
+
+    @staticmethod
+    def _scale_region(region, *, scale_x, scale_y):
+        scaled = dict(region)
+        for key in ("x0", "x1", "width", "centroid_x"):
+            if key in scaled and scaled[key] is not None:
+                scaled[key] = round(float(scaled[key]) * scale_x, 2) if "centroid" in key else int(round(float(scaled[key]) * scale_x))
+        for key in ("y0", "y1", "height", "centroid_y"):
+            if key in scaled and scaled[key] is not None:
+                scaled[key] = round(float(scaled[key]) * scale_y, 2) if "centroid" in key else int(round(float(scaled[key]) * scale_y))
+        return scaled
+
+    def _compute(self, frame) -> dict[str, Any]:
+        scored_frame, scale_x, scale_y = self._score_frame(frame)
+        score_map = self._method(scored_frame)
+        metrics = self._perceptor._summarize_experiment_map(score_map)
+        plausible_region = self._perceptor._select_plausible_region(
+            metrics["top_regions"],
+            image_height=int(scored_frame.shape[0]),
+            image_width=int(scored_frame.shape[1]),
+        )
+        display_score_map = cv2.resize(
+            score_map,
+            (int(frame.shape[1]), int(frame.shape[0])),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        display_regions = [
+            self._scale_region(region, scale_x=scale_x, scale_y=scale_y)
+            for region in metrics["top_regions"]
+        ]
+        display_plausible_region = (
+            self._scale_region(plausible_region, scale_x=scale_x, scale_y=scale_y)
+            if plausible_region is not None
+            else None
+        )
+        plausible_score = float(plausible_region["plausible_score"]) if plausible_region is not None else 0.0
+        plausible_area = int(plausible_region["pixel_count"]) if plausible_region is not None else 0
+        predicted_label = "CLEAR"
+        if self._positive_threshold is not None and plausible_score >= self._positive_threshold:
+            if self._type_threshold is not None and plausible_area < self._type_threshold:
+                predicted_label = "PERSON"
+            else:
+                predicted_label = "MOWER"
+        return {
+            "score_map": display_score_map,
+            "top_regions": display_regions,
+            "plausible_region": display_plausible_region,
+            "plausible_score": plausible_score,
+            "plausible_area": plausible_area,
+            "predicted_label": predicted_label,
+        }
+
+    def annotate(self, frame, *, frame_count, fps):
+        if self._last_result is None or frame_count == 1 or frame_count % self._refresh_every == 0:
+            self._last_result = self._compute(frame)
+
+        overlay = frame.copy()
+        score_map = self._last_result["score_map"]
+        heat = cv2.applyColorMap(
+            cv2.normalize(score_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+            cv2.COLORMAP_TURBO,
+        )
+        overlay = cv2.addWeighted(overlay, 1.0 - self._alpha, heat, self._alpha, 0.0)
+        self._perceptor._draw_region_overlays(overlay, self._last_result["top_regions"], color=(160, 160, 160))
+        plausible_region = self._last_result["plausible_region"]
+        predicted_label = self._last_result["predicted_label"]
+        obstacle_positive = predicted_label != "CLEAR"
+        plausible_color = (0, 165, 255) if obstacle_positive else (0, 200, 0)
+        if plausible_region is not None:
+            cv2.rectangle(
+                overlay,
+                (int(plausible_region["x0"]), int(plausible_region["y0"])),
+                (int(plausible_region["x1"]), int(plausible_region["y1"])),
+                plausible_color,
+                3,
+            )
+            cv2.putText(
+                overlay,
+                f"{predicted_label} {self._last_result['plausible_score']:.1f}",
+                (int(plausible_region["x0"]) + 4, max(90, int(plausible_region["y0"]) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                plausible_color,
+                2,
+                cv2.LINE_AA,
+            )
+        threshold_summary = "threshold=unfit"
+        if self._positive_threshold is not None:
+            threshold_summary = f"trip>={self._positive_threshold:.1f}"
+        status = (
+            f"detector={self._mode} refresh={self._refresh_every} "
+            f"score={self._last_result['plausible_score']:.1f} "
+            f"{threshold_summary} fps={fps:.2f}"
+        )
+        cv2.putText(
+            overlay,
+            status,
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            f"frame {frame_count}",
+            (12, 52),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            "orange=obstacle threshold met, green=below threshold, gray=other candidate regions",
+            (12, max(78, frame.shape[0] - 18)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        return overlay
 
 
 def _ffprobe_stream_payload(url, transport="tcp", tls_verify=False, ffprobe_bin="ffprobe"):
@@ -307,6 +528,28 @@ def parse_args():
         default=95,
         help="JPEG quality for saved debug frames.",
     )
+    parser.add_argument(
+        "--detector-baseline-dir",
+        help="Still-image directory used to build the live anomaly detector baseline.",
+    )
+    parser.add_argument(
+        "--detector-mode",
+        choices=["lab_illumination_intersection", "baseline_suppressed_combo"],
+        default="baseline_suppressed_combo",
+        help="Residual-map detector to overlay when --detector-baseline-dir is set.",
+    )
+    parser.add_argument(
+        "--detector-refresh-every",
+        type=int,
+        default=5,
+        help="Recompute the anomaly overlay every N source frames.",
+    )
+    parser.add_argument(
+        "--detector-alpha",
+        type=float,
+        default=0.35,
+        help="Heatmap blend amount for the detector overlay.",
+    )
     return parser.parse_args()
 
 
@@ -331,6 +574,20 @@ def main():
         max_saved=args.debug_max_saved,
         jpeg_quality=args.debug_jpeg_quality,
     )
+    live_detector = None
+    if args.detector_baseline_dir:
+        live_detector = LiveAnomalyOverlay(
+            baseline_image_dir=args.detector_baseline_dir,
+            mode=args.detector_mode,
+            refresh_every=args.detector_refresh_every,
+            alpha=args.detector_alpha,
+        )
+        print(
+            "live_detector "
+            f"baseline_dir={args.detector_baseline_dir} "
+            f"mode={args.detector_mode} "
+            f"refresh_every={args.detector_refresh_every}"
+        )
 
     with FFmpegVideoStream(
         url=args.url,
@@ -363,17 +620,20 @@ def main():
 
             # Placeholder for downstream perception work. Replace this block with model inference.
             if args.display:
-                overlay = frame.copy()
-                cv2.putText(
-                    overlay,
-                    f"frame {frame_count}  {fps:.2f} fps",
-                    (12, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
+                if live_detector is not None:
+                    overlay = live_detector.annotate(frame, frame_count=frame_count, fps=fps)
+                else:
+                    overlay = frame.copy()
+                    cv2.putText(
+                        overlay,
+                        f"frame {frame_count}  {fps:.2f} fps",
+                        (12, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
                 cv2.imshow(args.window_name, overlay)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break

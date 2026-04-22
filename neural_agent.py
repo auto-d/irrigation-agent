@@ -3,13 +3,69 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
 import json
+import logging
+import os
+import re
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List
 
 from llm_agent import LlmAgent, Tool
 from llm_backend import Backend
 from planner import BasePlanner, Decision, Event, PlannerProxy, PlannerRunResult
+
+_LOG = logging.getLogger(__name__)
+FAILURE_LOG_DIR = Path(os.getenv("IRRIGATION_FAILURE_LOG_DIR", "/tmp/irrigation-agent-failures"))
+
+
+FINAL_DECISION_SCHEMA = {
+    "name": "irrigation_planner_decision",
+    "type": "json_schema",
+    "strict": True,
+    "description": "Final structured decision emitted by the irrigation planner after any tool use.",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["water_on", "water_off", "no_op", "notify"],
+            },
+            "duration_seconds": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+            },
+            "rationale": {
+                "type": "string",
+            },
+            "comments": {
+                "type": "string",
+                "description": "Free-form planner notes, caveats, or residue worth mining later.",
+            },
+        },
+        "required": ["action", "duration_seconds", "rationale", "comments"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _normalize_precipitation_window(window: str) -> str:
+    """Normalize planner-supplied window strings to the accepted shorthand."""
+    normalized = window.strip().lower()
+    match = re.fullmatch(r"(\d+)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)", normalized)
+    if not match:
+        return window
+    amount = match.group(1)
+    unit = match.group(2)
+    if unit.startswith(("minute", "min")) or unit == "m":
+        suffix = "M"
+    elif unit.startswith(("hour", "hr")) or unit == "h":
+        suffix = "H"
+    elif unit.startswith("day") or unit == "d":
+        suffix = "D"
+    else:
+        suffix = "W"
+    return f"{amount}{suffix}"
 
 
 class WeatherPerceptionTool(Tool):
@@ -35,6 +91,10 @@ class WeatherPerceptionTool(Tool):
 
     async def run(self, instance, callback=None):
         arguments = self.validate_instance(instance)
+        if arguments.get("forecast_hours") is not None and arguments.get("forecast_days") is not None:
+            # The planner may over-specify the window; prefer the more specific
+            # hourly request rather than failing the entire planning episode.
+            arguments["forecast_days"] = None
         event = await self.proxy.perceive("weather", **arguments)
         self.event_sink.append(event)
         return self.build_result(instance.call_id, "ok", {"event": self._event_to_result(event)})
@@ -72,6 +132,8 @@ class PrecipitationPerceptionTool(Tool):
 
     async def run(self, instance, callback=None):
         arguments = self.validate_instance(instance)
+        if "window" in arguments and isinstance(arguments["window"], str):
+            arguments["window"] = _normalize_precipitation_window(arguments["window"])
         event = await self.proxy.perceive("precipitation", **arguments)
         self.event_sink.append(event)
         return self.build_result(instance.call_id, "ok", {"event": WeatherPerceptionTool._event_to_result(event)})
@@ -125,6 +187,17 @@ class CameraPerceptionTool(Tool):
 
     async def run(self, instance, callback=None):
         arguments = self.validate_instance(instance)
+        save_frame = arguments.get("save_frame")
+        if isinstance(save_frame, str) and save_frame.strip().lower() in {
+            "",
+            "none",
+            "no",
+            "never",
+            "off",
+            "false",
+            "null",
+        }:
+            arguments.pop("save_frame", None)
         event = await self.proxy.perceive("camera", **arguments)
         self.event_sink.append(event)
         return self.build_result(instance.call_id, "ok", {"event": WeatherPerceptionTool._event_to_result(event)})
@@ -220,7 +293,7 @@ class NotificationActionTool(Tool):
             },
         )
 
-class NeuralPlanner(LlmAgent, BasePlanner): 
+class NeuralPlanner(LlmAgent, BasePlanner):
     """LLM-backed planner."""
 
     name = "neural"
@@ -239,14 +312,13 @@ class NeuralPlanner(LlmAgent, BasePlanner):
                     "Your job is to decide whether to water now, stop watering, do nothing, or message a human "
                     "when the situation is ambiguous or concerning. "
                     "Use the available tools to inspect only the information you need. "
-                    "Do not refer to internal framework concepts such as actors, proxies, or planner internals. "
                     "Think in domain terms: recent watering, recent rain, forecast rain, obstacles on the lawn, "
                     "daylight versus nighttime, "
                     "and whether a human should be notified. "
-                    "Never begin watering outside the allowed daylight watering window. "
+                    "Never begin watering outside daylight hours. "
                     "If you use a messaging tool, reserve it for warnings, failures, or ambiguity worth surfacing to a human. "
-                    "After you are done gathering information and taking any necessary tool actions, respond with compact JSON "
-                    "containing keys action, duration_seconds, rationale."
+                    "After you are done gathering information and taking any necessary tool actions, "
+                    "emit your final decision through the structured response contract."
                 )
             ],
         )
@@ -270,6 +342,7 @@ class NeuralPlanner(LlmAgent, BasePlanner):
             text_chunks = await self.chat(
                 [prompt],
                 tools=tools,
+                text_format=FINAL_DECISION_SCHEMA,
             )
             content = "\n".join(text_chunks).strip()
             parsed = json.loads(content)
@@ -279,7 +352,10 @@ class NeuralPlanner(LlmAgent, BasePlanner):
                 action=parsed.get("action", "no_op"),
                 duration_seconds=parsed.get("duration_seconds"),
                 rationale=parsed.get("rationale", "No rationale provided."),
-                metadata={"raw_response": content},
+                metadata={
+                    "raw_response": content,
+                    "comments": parsed.get("comments", ""),
+                },
             )
             return PlannerRunResult(
                 timestamp=now,
@@ -290,7 +366,41 @@ class NeuralPlanner(LlmAgent, BasePlanner):
                 action_count=getattr(proxy, "action_count", 0),
             )
         except Exception as err:
+            diagnostic_path = self._write_failure_diagnostic(
+                self._failure_diagnostic(prompt=prompt, now=now)
+            )
+            _LOG.error(
+                "Neural planner execution failed; wrote diagnostic to %s",
+                diagnostic_path,
+            )
             raise RuntimeError(f"Neural planner execution failed: {type(err).__name__}: {err}") from err
+
+    def _failure_diagnostic(self, *, prompt: str, now: dt.datetime) -> Dict[str, Any]:
+        """Return a planner diagnostic snapshot suitable for artifact capture."""
+        recent_events = [
+            {
+                "timestamp": event.timestamp.isoformat(),
+                "source": event.source,
+                "type": event.type,
+                "payload": event.payload,
+            }
+            for event in self._events[-12:]
+        ]
+        return {
+            "planner": self.name,
+            "decision_time": now.isoformat(),
+            "prompt": prompt,
+            "recent_events": recent_events,
+            "message_history": self.memory.messages,
+        }
+
+    def _write_failure_diagnostic(self, diagnostic: Dict[str, Any]) -> str:
+        """Persist a failure transcript to a local holding cell and return its path."""
+        FAILURE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = FAILURE_LOG_DIR / f"neural-planner-failure-{timestamp}-{uuid.uuid4().hex[:8]}.json"
+        path.write_text(json.dumps(diagnostic, indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
 
     def _decision_prompt(self, now: dt.datetime) -> str:
         recent_events = [
@@ -303,14 +413,6 @@ class NeuralPlanner(LlmAgent, BasePlanner):
             for event in self._events[-12:]
         ]
         return (
-            "You are deciding what to do about watering a residential lawn right now. "
-            "You may inspect the forecast, recent rainfall, irrigation state, and lawn camera before answering. "
-            "You may also start or stop watering, run a short watering cycle, or send a human a Discord message if the situation warrants it. "
-            "Watering is only allowed during the local daylight watering window. "
-            "Return only valid JSON with keys action, duration_seconds, rationale. "
-            "Allowed final action values: water_on, water_off, no_op, notify. "
-            "Use water_on when the decision is to water the lawn, water_off when the decision is to stop watering, "
-            "no_op when the right move is to leave things alone, and notify when the main outcome is to surface the situation to a human.\n\n"
             f"Decision time: {now.isoformat()}\n"
             f"Wall-time guard: {json.dumps(self._watering_window_summary(now), sort_keys=True)}\n"
             f"Recent events: {json.dumps(recent_events, sort_keys=True)}"

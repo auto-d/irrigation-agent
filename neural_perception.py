@@ -164,7 +164,7 @@ class NeuralSecurityCameraPerceptor:
             height=int(stream_info["height"]),
             sample_frames=max(1, sample_frames),
         )
-        if save_frame_path:
+        if self._save_frame_requested(save_frame_path):
             saved_path = self._write_frame(frame, save_frame_path)
             cleanup_path = None
         else:
@@ -185,6 +185,8 @@ class NeuralSecurityCameraPerceptor:
             system_prompt=(
                 "You inspect a lawn camera for irrigation safety. "
                 "Classify whether a person, animal, mower, or other obstacle is present on the lawn or in the watering path. "
+                "A garden hose supplying water to the sprinkler and the watering tripod or sprinkler head itself are normal parts "
+                "of the irrigation setup and should not be treated as hazards on their own. "
                 "Ignore normal fixed background context such as patios, pools, patio furniture, fences, trees, and landscaping "
                 "unless they indicate an active hazard or clearly occupy the irrigated lawn area. "
                 "Set watering_safe to false whenever watering would be unsafe or materially ambiguous."
@@ -194,8 +196,10 @@ class NeuralSecurityCameraPerceptor:
                 "Report obstacle_detected as true only when something materially relevant to watering is on the lawn, crossing the spray path, "
                 "or would make watering unsafe right now. "
                 "Do not mark obstacle_detected true for ordinary fixed scene context at the perimeter or patio area. "
-                "Treat humans, pets, wildlife, active mower activity, toys left on the grass, hoses stretched across the lawn, ladders, "
-                "or movable equipment on the grass as obstacles when they materially block safe watering."
+                "Treat humans, pets, wildlife, active mower activity, toys left on the grass, ladders, "
+                "or movable equipment on the grass as obstacles when they materially block safe watering. "
+                "Do not treat the irrigation hose, the sprinkler tripod, or the sprinkler head as obstacles merely because they are visible; "
+                "those are expected irrigation components unless they appear damaged, misplaced, or create a distinct trip or entanglement hazard."
             ),
             image_url=image_data_url,
             schema=self.OUTPUT_SCHEMA,
@@ -233,10 +237,20 @@ class NeuralSecurityCameraPerceptor:
     def _write_frame(frame: Any, path: str) -> str:
         """Write one captured frame to disk."""
         output = Path(path).expanduser()
+        if not output.suffix:
+            output = output.with_suffix(".jpg")
         output.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(output), frame):
             raise RuntimeError(f"failed to write captured frame to {output}")
         return str(output)
+
+    @staticmethod
+    def _save_frame_requested(path: str | None) -> bool:
+        """Treat common planner sentinels as requests not to persist a frame."""
+        if path is None:
+            return False
+        normalized = path.strip().lower()
+        return normalized not in {"", "none", "no", "never", "off", "false", "null"}
 
     @classmethod
     def _write_temp_frame(cls, frame: Any) -> tuple[str, str]:
